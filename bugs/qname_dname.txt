@@ -1,0 +1,48 @@
+www.linux.com queries result for linux.com's SOA, but linux.com SOA query did
+not fetched from cache since new qname (linux.com) query.
+
+
+**********
+
+Q	www.linux.com	IN	SOA	-1	127.0.0.1
+<< www.linux.com: cache hits: 0/0 records >>
+DATA	linux.com	IN	SOA	3415	1	ns1.linux-foundation.net hostmaster.linux-foundation.org 2010121400 7200 3600 2419200 43200
+<< www.linux.com: resolve time: 588 ms >>
+END
+Q	www.linux.com	IN	ANY	1	127.0.0.1
+<< www.linux.com: cache hits: 7/0 records >>
+DATA	www.linux.com	IN	CNAME	2773	1	linux.com [c]
+DATA	linux.com	IN	MX	3415	1	20	smtp2.linux.com [c]
+DATA	linux.com	IN	MX	3415	1	10	smtp1.linux.com [c]
+DATA	linux.com	IN	NS	86215	1	ns2.linux-foundation.net [c]
+DATA	linux.com	IN	NS	86215	1	ns1.linux-foundation.net [c]
+DATA	linux.com	IN	SOA	3415	1	ns1.linux-foundation.net hostmaster.linux-foundation.org 2010121400 7200 3600 2419200 43200 [c]
+DATA	linux.com	IN	A	3415	1	140.211.167.55 [c]
+END
+Q	linux.com	IN	SOA	-1	127.0.0.1
+<< linux.com: cache hits: 0/0 records >>
+DATA	linux.com	IN	SOA	3415	1	ns1.linux-foundation.net hostmaster.linux-foundation.org 2010121400 7200 3600 2419200 43200
+<< linux.com: resolve time: 478 ms >>
+END
+Q	linux.com	IN	ANY	1	127.0.0.1
+<< linux.com: cache hits: 6/0 records >>
+DATA	linux.com	IN	MX	3415	1	20	smtp2.linux.com [c]
+DATA	linux.com	IN	MX	3415	1	10	smtp1.linux.com [c]
+DATA	linux.com	IN	NS	86215	1	ns2.linux-foundation.net [c]
+DATA	linux.com	IN	NS	86215	1	ns1.linux-foundation.net [c]
+DATA	linux.com	IN	SOA	3415	1	ns1.linux-foundation.net hostmaster.linux-foundation.org 2010121400 7200 3600 2419200 43200 [c]
+DATA	linux.com	IN	A	3415	1	140.211.167.55 [c]
+END
+Q	smtp2.linux.com	IN	A	-1	127.0.0.1
+<< smtp2.linux.com: cache hits: 0/0 records >>
+END
+Q	smtp1.linux.com	IN	A	-1	127.0.0.1
+<< smtp1.linux.com: cache hits: 0/0 records >>
+END
+Q	ns2.linux-foundation.net	IN	A	-1	127.0.0.1
+<< ns2.linux-foundation.net: cache hits: 0/0 records >>
+END
+Q	ns1.linux-foundation.net	IN	A	-1	127.0.0.1
+<< ns1.linux-foundation.net: cache hits: 0/0 records >>
+END
+

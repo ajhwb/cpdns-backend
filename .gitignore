@@ -1,0 +1,4 @@
+docs/
+*.o
+backend
+test

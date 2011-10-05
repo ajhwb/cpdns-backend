@@ -1,0 +1,50 @@
+[ajhwb@godard songs]$ host -a www.l.google.com
+Trying "www.l.google.com"
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 24320
+;; flags: qr rd ra; QUERY: 1, ANSWER: 5, AUTHORITY: 0, ADDITIONAL: 0
+
+;; QUESTION SECTION:
+;www.l.google.com.		IN	ANY
+
+;; ANSWER SECTION:
+www.l.google.com.	223	IN	A	74.125.235.52
+www.l.google.com.	223	IN	A	74.125.235.51
+www.l.google.com.	223	IN	A	74.125.235.48
+www.l.google.com.	223	IN	A	74.125.235.50
+www.l.google.com.	223	IN	A	74.125.235.49
+
+Received 114 bytes from 8.8.8.8#53 in 45 ms
+[ajhwb@godard songs]$ 
+[ajhwb@godard songs]$ 
+[ajhwb@godard songs]$ host -a www.google.com
+Trying "www.google.com"
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 52940
+;; flags: qr rd ra; QUERY: 1, ANSWER: 6, AUTHORITY: 0, ADDITIONAL: 0
+
+;; QUESTION SECTION:
+;www.google.com.			IN	ANY
+
+;; ANSWER SECTION:
+www.google.com.		86298	IN	CNAME	www.l.google.com.
+www.l.google.com.	198	IN	A	74.125.235.52
+www.l.google.com.	198	IN	A	74.125.235.50
+www.l.google.com.	198	IN	A	74.125.235.48
+www.l.google.com.	198	IN	A	74.125.235.49
+www.l.google.com.	198	IN	A	74.125.235.51
+
+Received 132 bytes from 8.8.8.8#53 in 20 ms
+
+
+
+Q	www.l.google.com	IN	ANY	1	127.0.0.1
+DATA	www.l.google.com	IN	A	286	1	74.125.235.48 [c]
+DATA	www.l.google.com	IN	A	286	1	74.125.235.49 [c]
+DATA	www.l.google.com	IN	A	286	1	74.125.235.50 [c]
+DATA	www.l.google.com	IN	A	286	1	74.125.235.51 [c]
+DATA	www.l.google.com	IN	A	286	1	74.125.235.52 [c]
+DATA	www.l.google.com	IN	A	287	1	74.125.235.48 [c]
+DATA	www.l.google.com	IN	A	287	1	74.125.235.49 [c]
+DATA	www.l.google.com	IN	A	287	1	74.125.235.50 [c]
+DATA	www.l.google.com	IN	A	287	1	74.125.235.51 [c]
+DATA	www.l.google.com	IN	A	287	1	74.125.235.52 [c]
+END

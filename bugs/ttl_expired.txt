@@ -1,0 +1,21 @@
+TTL was expired after SOA record
+
+
+****
+
+% Q	facebook.com	IN	SOA	-1	127.0.0.1
+<< cache hits: 1 records >>
+DATA	facebook.com	IN	SOA	86006	1	ns0.facebook.com dns.facebook.com 2011081200 7200 1800 604800 3600 [c]
+END
+Q	facebook.com	IN	ANY	1	127.0.0.1
+<< cache hits: 11 records >>
+<< facebook.com: ttl was expired >>
+<< facebook.com: resolve time: 723 ms >>
+END
+Q	*.com	IN	ANY	1	127.0.0.1
+END
+Q	*.	IN	ANY	1	127.0.0.1
+END
+
+
+****

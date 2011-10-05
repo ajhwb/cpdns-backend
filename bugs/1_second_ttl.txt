@@ -1,0 +1,15 @@
+Problem for name that has min ttl
+
+Q	block.a.id.opendns.com	IN	ANY	1	127.0.0.1
+<< cache hits: 1 records >>
+<< block.a.id.opendns.com: ttl was expired >>
+<< block.a.id.opendns.com: resolve time: 248 ms >>
+<< cache hits: 1 records >>
+<< block.a.id.opendns.com: ttl was expired >>
+<< block.a.id.opendns.com: resolve time: 285 ms >>
+<< cache hits: 1 records >>
+<< block.a.id.opendns.com: ttl was expired >>
+<< block.a.id.opendns.com: resolve time: 267 ms >>
+<< cache hits: 1 records >>
+....
+

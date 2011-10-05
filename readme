@@ -1,0 +1,21 @@
+Cool PowerDNS Backend
+=====================
+
+This is a demonstration pipe backend for PowerDNS (http://powerdns.com), 
+currently it can do these following task.
+
+- Recurse to defined nameserver
+- Manage domain request that usefull for filtering
+- Implement record caching
+- Connection to RDBMS
+- Configurable with configuration file
+- and some planned features...
+
+To build this you will need these following libraries:
+
+- hiredis, https://github.com/antirez/hiredis
+- MySQL, http://mysql.org
+- ldns, http://www.nlnetlabs.nl/projects/ldns/
+- Glib, http://gtk.org
+
+Ardhan
