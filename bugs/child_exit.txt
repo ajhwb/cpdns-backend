@@ -1,0 +1,7 @@
+<< www3.l.google.com: resolve time: 33 ms, 16 records >>
+END
+Q	l.google.com	IN	SOA	-1	202.57.2.41 [ID:2080018268]
+<< l.google.com: cache hits: 5/1 records >>
+Oct 07 03:27:30 [PIPEBackend] unable to receive data from coprocess. Child closed pipe
+Oct 07 03:27:30 Database module reported condition which prevented lookup (Child closed pipe) sending out servfail
+

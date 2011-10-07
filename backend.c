@@ -252,10 +252,10 @@ static void set_backend_id(void)
 struct timespec ts_diff(const struct timespec *start, const struct timespec *end)
 {
 	struct timespec ts = { .tv_sec = 0L, .tv_nsec = 0L };
-	double d1, d2, delta;
+	unsigned long long d1, d2, delta;
 
-	d1 = (double) start->tv_sec * NSEC_PER_SEC + start->tv_nsec;
-	d2 = (double) end->tv_sec * NSEC_PER_SEC + end->tv_nsec;
+	d1 = (unsigned long long) start->tv_sec * NSEC_PER_SEC + start->tv_nsec;
+	d2 = (unsigned long long) end->tv_sec * NSEC_PER_SEC + end->tv_nsec;
 	delta = d2 - d1;
 
 	while (delta >= NSEC_PER_SEC) {
@@ -614,11 +614,10 @@ int do_query(const struct query *q)
 
 		if (config.debug) {
 			diff = ts_diff(&start, &end);
-			fprintf(stderr, "<< %s: resolve time: %i ms (%li - %li), "
-				"%i records >>\n", q->qname, 
-				(int) ((double) diff.tv_sec * NSEC_PER_SEC + 
-				diff.tv_nsec) / USEC_PER_SEC, 
-				start.tv_sec, end.tv_sec, result);
+			fprintf(stderr, "<< %s: %i records in %llu ms >>\n", 
+				q->qname, result,
+				((unsigned long long) diff.tv_sec * NSEC_PER_SEC + 
+				diff.tv_nsec) / USEC_PER_SEC);
 		}
 
 		if (result > 0) {
