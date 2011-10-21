@@ -14,8 +14,15 @@ currently it can do these following task.
 To build this you will need these following libraries:
 
 - hiredis, https://github.com/antirez/hiredis
-- MySQL, http://mysql.org
+- MySQL http://mysql.org (if used with MySQL)
+- PostgreSQL, http://postgresql.org (if used with PostgreSQL)
 - ldns, http://www.nlnetlabs.nl/projects/ldns/
 - Glib, http://gtk.org
 
-Ardhan
+To push into project repository:
+
+git remote add origin git@github.com:ajhwb/cpdns-backend.git
+git push -u origin master
+
+
+Ardhan Madras <ajhwb@knac.com>
