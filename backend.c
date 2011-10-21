@@ -18,6 +18,16 @@
 #include <ldns/ldns.h>
 #include <queue.h>
 
+#define MYSQLS		0x00000001
+#define PGSQLS		0x00000002
+#define DB_BACKEND	MYSQLS
+
+#if DB_BACKEND == MYSQLS
+# include <mysql/mysql.h>
+#elif DB_BACKEND == PGSQLS
+# include <libpq-fe.h>
+#endif
+
 #define CONFIG_FILE	"/etc/pdns/backend.conf"
 /* Unique prefix string for each key, example cpdns:x.com ... */
 #define KEY_PREFIX	"cpdns"
@@ -101,10 +111,15 @@ struct log {
 
 static redisContext *cachedb_ctx;
 static ldns_resolver *resolver;
-static MYSQL *my_conn;
 sqlite3 *cachedb;
 static struct config config;
 static int backend_id;
+
+#if DB_BACKEND == MYSQLS
+static MYSQL *my_conn;
+#elif DB_BACKEND == PGSQLS
+static PGconn *pg_conn;
+#endif
 
 
 int lookup_cachedb(const struct query*, queue_t**);
@@ -768,15 +783,14 @@ err:
 	return 0;
 }
 
-int connect_database(unsigned int timeout)
+#if DB_BACKEND == MYSQLS
+static inline int connect_database_mysql(unsigned int timeout)
 {
 	int ret;
 	MYSQL *ptr;
 
-	if ((my_conn = mysql_init(0)) == NULL) {
-		fprintf(stderr, "<< could not initialize db >>\n");
-		exit(EXIT_FAILURE);
-	}
+	if ((my_conn = mysql_init(0)) == NULL)
+		return 0;
 
 	ret = mysql_options(my_conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
 	if (ret == 0) {
@@ -786,20 +800,58 @@ int connect_database(unsigned int timeout)
 					config.port, NULL, CLIENT_MULTI_RESULTS);
 		if (ptr == NULL) {
 			mysql_close(my_conn);
-			fprintf(stderr, "<< could not connect to db >>\n");
-			exit(EXIT_FAILURE);
 			return 0;
 		}
 	}
 
 	return 1;
 }
+#endif
+
+#if DB_BACKEND == PGSQLS
+static inline int connect_database_pgsql(unsigned int timeout)
+{
+	char *cmd;
+	int status;
+
+	cmd = g_strdup_printf("hostaddr=%s port=%i dbname=%s user=%s password=%s "
+			      "connect_timeout=%i", config.host, config.port,
+			      config.database, config.username, config.password,
+			      timeout);
+	pg_conn = PQconnectdb(cmd);
+	status = PQstatus (pg_conn);
+	g_free(cmd);
+
+	if (status == CONNECTION_OK)
+		return 1;
+	else
+		return 0;
+}
+#endif
+
+int connect_database(unsigned int timeout)
+{
+	int ret;
+#if DB_BACKEND == MYSQLS
+	ret = connect_database_mysql(timeout);
+#elif DB_BACKEND == PGSQLS
+	ret = connect_database_pgsql(timeout);
+#endif
+	if (ret == 0 && config.debug)
+		fprintf(stderr, "<< could not connect to db >>\n");
+	return ret;
+}
 
 static void close_database(void)
 {
+#if DB_BACKEND == MYSQLS
 	mysql_close(my_conn);
+#elif DB_BACKEND == PGSQLS
+	PQfinish(pg_conn);
+#endif
 }
 
+#if DB_BACKEND == MYSQLS
 static int search_blacklist(const struct query *q, queue_t **blacklist)
 {
 	MYSQL_RES *res;
@@ -809,12 +861,10 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 	struct answer *ans;
 	queue_t *data = NULL;
 
-	connect_database(3);
-/*
-	cmd = sqlite3_mprintf("call is_block('%q', '%q')",
-				q->remote_ip, q->qname);
-*/
-	cmd = sqlite3_mprintf("SELECT id FROM test WHERE name='%q'", q->qname);
+	if (connect_database(3) == 0)
+		exit(EXIT_FAILURE);
+
+	cmd = sqlite3_mprintf("call is_block('%q', '%q')", q->remote_ip, q->qname);
 
 	if (config.debug)
 		fprintf(stderr, "<< %s >>\n", cmd);
@@ -885,6 +935,82 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 
 	return num_rows;
 }
+#endif
+
+#if DB_BACKEND == PGSQLS
+static int search_blacklist(const struct query *q, queue_t **blacklist)
+{
+	PGresult *res;
+	struct answer *ans;
+	queue_t *data = NULL;
+	char *tmp;
+	int ret, num_rows;
+
+	if (connect_database(3) == 0)
+		return 0;
+
+	tmp = g_strdup_printf("select check_filter_status('%s', '%s')",
+			      q->qname, q->remote_ip);
+	res = PQexec (pg_conn, tmp);
+	g_free (tmp);
+
+	ret = PQresultStatus (res);
+	if (ret != PGRES_TUPLES_OK) {
+		PQclear(res);
+		close_database();
+		if (config.debug)
+			fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
+		return -1;
+	}
+
+	if (PQntuples(res) == 0) {
+		PQclear(res);
+		close_database();
+		if (config.debug)
+			fprintf(stderr, "<< %s: invalid query returns >>\n", __func__);
+	}
+
+	tmp = PQgetvalue (res, 0, 0);
+	if (tmp == NULL || strtol(tmp, NULL, 10) != 2) {
+		PQclear(res);
+		close_database();
+		return 0;
+	}
+
+	/* Build A and SOA record, PowerDNS need at least SOA 
+	 * and A record to make query answered correctly.
+	 */
+
+	ans = xmalloc(sizeof(struct answer));
+
+	strcpy(ans->qname, q->qname);
+	strcpy(ans->data, config.landing_page);
+	ans->qtype = RR_TYPE_A;
+	ans->ttl = 3600;
+
+	data = queue_prepend(data, ans);
+
+	ans = xmalloc(sizeof(struct answer));
+
+	strcpy(ans->qname, q->qname);
+	strcpy(ans->data, "ns1.kdns.com dns-admin.kdns.com "
+	       "2011101100 7200 1800 1209600 300");
+	ans->qtype = RR_TYPE_SOA;
+	ans->ttl = 3600;
+
+	data = queue_prepend(data, ans);
+
+	if (config.debug)
+		fprintf(stderr, "<< %s: record found >>\n", q->qname);
+
+	PQclear(res);
+	close_database();
+
+	*blacklist = data;
+
+	return num_rows;
+}
+#endif
 
 static int insert_blacklist_data(const struct answer *ans)
 {
