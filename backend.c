@@ -99,10 +99,12 @@ struct config {
 	char *cache_host;
 	char *log_database;
 	char *landing_page;
+	char *log_dir;
 	unsigned short port;
 	unsigned short cache_port;
 	int filter;
 	int log;
+	int log_file;
 	int debug;
 };
 
@@ -254,7 +256,7 @@ void answer_free(struct answer *ans)
 static int init_resolver(void)
 {
 	ldns_status status;
-	const struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+	const struct timeval tv = { .tv_sec = 1, .tv_usec = 200000 };
 
 	resolver = NULL;
 
@@ -262,10 +264,6 @@ static int init_resolver(void)
 
 	if (status != LDNS_STATUS_OK)
 		return 0;
-	/*
-	 * Don't know yet how ldns calculate timeout time, time(1) show me
-	 * that 1 second tv_sec equals to 3 seconds :|
-	 */
 	ldns_resolver_set_timeout(resolver, tv);
 
 	return 1;
@@ -402,6 +400,8 @@ static int rr2answer(const ldns_rr *rr, struct answer *ans)
 
 	/* Don't manage to remove dot from name, imagine root domain query '.' */
 	str_len = strlen(str);
+	if (str_len > 1)
+		str_len--;
 	if (str_len < sizeof(result.qname) - 1) {
 		memcpy(result.qname, str, str_len);
 		result.qname[str_len] = 0;
@@ -544,7 +544,10 @@ static int process_result(const ldns_pkt *pkt, queue_t **result)
 
 	return retval;
 }
-
+/*
+ * do_query:
+ * Returns: ldns_enum_plt_rcode enumerations.
+ */
 int do_query(const struct query *q)
 {
 	queue_t *data, *ptr;
@@ -557,6 +560,7 @@ int do_query(const struct query *q)
 	ldns_pkt *pkt;
 
 
+	memset(&fdiff, 0, sizeof(struct timespec));
 	if (config.filter) {
 		result = 0;
 
@@ -585,23 +589,30 @@ int do_query(const struct query *q)
 					print_answer(ans, stderr, 0);
 			}
 
-			if (config.log) {
+			/*
+			 * Depends on version of PowerDNS, it may query for SOA
+			 * record first then ANY record, and vice-versa.
+			 */
+			if ((config.log || config.log_file) 
+			    && q->qtype_id == RR_TYPE_SOA) {
 				log.qtime = 0;
-				log.ftime = 
+				log.ftime = ts2ms(&fdiff);
 				log.blacklist = 1;
-				log.exist = 1;
+				log.exist = 0;
 				log.status = 0;
 				log.qtype = q->qtype_id;
 				log.reqtime = time(NULL);
 				sprintf(log.qname, "%s", q->qname);
 				sprintf(log.remote, "%s", q->remote_ip);
-				insert_log(&log);
-				write_log(&log);
+				if (config.log)
+					insert_log(&log);
+				if (config.log_file)
+					write_log(&log);
 			}
 
 			free_cachedb_data(data);
 
-			return 1;
+			return LDNS_RCODE_NOERROR;
 		}
 	}
 
@@ -616,10 +627,27 @@ int do_query(const struct query *q)
 				print_answer(ans, stderr, 1);
 			ptr = ptr->next;
 		}
+
 		free_cachedb_data(data);
-		return 1;
+		if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
+			log.qtime = 0;
+			log.ftime = ts2ms(&fdiff);
+			log.blacklist = 0;
+			log.exist = 1;
+			log.status = 0;
+			log.qtype = q->qtype_id;
+			log.reqtime = time(NULL);
+			sprintf(log.qname, "%s", q->qname);
+			sprintf(log.remote, "%s", q->remote_ip);
+			if (config.log)
+				insert_log(&log);
+			if (config.log_file)
+				write_log(&log);
+		}
+
+		return LDNS_RCODE_NOERROR;
 	} else if (result < 0)
-		return 1;
+		return LDNS_RCODE_NOERROR;
 
 	init_resolver();
 
@@ -627,10 +655,10 @@ int do_query(const struct query *q)
 	if (!rdf) {
 		if (config.debug)
 			fprintf(stderr, "<< invalid name: '%s' >>\n", q->qname);
-		return 0;
+		return LDNS_RCODE_FORMERR;
 	}
 
-	if (config.debug || config.log)
+	if (config.debug || config.log || config.log_file)
 		clock_gettime(CLOCK_REALTIME, &start);
 
 	pkt = ldns_resolver_query(resolver, rdf,
@@ -638,8 +666,10 @@ int do_query(const struct query *q)
 				  LDNS_RR_CLASS_IN, 
 				  LDNS_RD);
 
-	if (config.debug || config.log)
+	if (config.debug || config.log || config.log_file) {
 		clock_gettime(CLOCK_REALTIME, &end);
+		diff = ts_diff(&start, &end);
+	}
 
 	clock_gettime(CLOCK_MONOTONIC, &tm);
 
@@ -647,7 +677,9 @@ int do_query(const struct query *q)
 	if (!pkt) {
 		if (config.debug)
 			fprintf(stderr, "<< resolve fail: %s >>\n", q->qname);
-		return 0;
+		destroy_resolver();
+		rcode = LDNS_RCODE_SERVFAIL;
+		goto log;
 	}
 
 	rcode = ldns_pkt_get_rcode(pkt);
@@ -657,15 +689,13 @@ int do_query(const struct query *q)
 
 		if (result > 0) {
 			clear_cachedb(q);
-			// sort_cachedb(data);
+			queue_sort(data, sort_cachedb_func);
 			insert_cachedb(q, data, tm);
 		}
 
-		if (config.debug) {
-			diff = ts_diff(&start, &end);
-			fprintf(stderr, "<< %s: %i records, resolved in %li ms >>\n", 
-				q->qname, result, ts2ms(&diff));
-		}
+		if (config.debug)
+			fprintf(stderr, "<< %s: %i records, resolved in %li "
+				"ms >>\n", q->qname, result, ts2ms(&diff));
 
 		if (result > 0) {
 			ptr = data;
@@ -690,22 +720,24 @@ int do_query(const struct query *q)
 	ldns_pkt_free(pkt);
 	destroy_resolver();
 
-	if (config.log) {
-		diff = ts_diff(&start, &end);
+log:
+	if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
 		log.reqtime = start.tv_sec;
-		log.qtime = ((double) diff.tv_sec * NSEC_PER_SEC + 
-				diff.tv_nsec) / USEC_PER_SEC;
+		log.qtime = ts2ms(&diff);
+		log.ftime = ts2ms(&fdiff);
 		log.blacklist = 0;
 		log.exist = rcode == LDNS_RCODE_NOERROR ? 1 : 0;
 		log.status = rcode;
 		log.qtype = q->qtype_id;
 		sprintf(log.qname, "%s", q->qname);
 		sprintf(log.remote, "%s", q->remote_ip);
-		insert_log(&log);
-		write_log(&log);
+		if (config.log)
+			insert_log(&log);
+		if (config.log_file)
+			write_log(&log);
 	}
 
-	return 0;
+	return rcode;
 }
 
 void set_dns_type(const char *qtype, struct query *q)
@@ -756,7 +788,9 @@ int parse_query(char *data, struct query *q)
 	else {
 		if (!(tmp = strchr(ptr, '\t')))
 			return 0;
-		snprintf(q->qname, tmp - ptr + 1, "%s", ptr);
+		type = xstrndup(ptr, tmp - ptr);
+		sprintf(q->qname, "%s", type);
+		free(type);
 	}
 
 	/* Class, actually always 'IN' type */
@@ -797,7 +831,9 @@ int parse_query(char *data, struct query *q)
 	ptr = ++tmp;
 	if (*ptr == '\0')
 		return 0;
-	sprintf(q->remote_ip, "%s", ptr);
+	if (!(tmp = strchr(ptr, '\n')))
+		return 0;
+	snprintf(q->remote_ip, tmp - ptr + 1, "%s", ptr);
 
 	return 1;
 }
@@ -805,11 +841,13 @@ int parse_query(char *data, struct query *q)
 int read_config(void)
 {
 	GKeyFile *key = g_key_file_new ();
-	char *host, *database, *username, *password, *cache_host, *log_database;
-	char *landing_page;
+	char *host, *database, *username, *password, *cache_host, 
+		*log_database, *log_dir, *landing_page;
 	int ret;
 
 	host = database = username = password = cache_host = log_database = NULL;
+	log_dir = NULL;
+
 	ret = g_key_file_load_from_file(key, CONFIG_FILE, G_KEY_FILE_NONE, NULL);
 	if (ret == 0) goto err;
 
@@ -827,12 +865,16 @@ int read_config(void)
 	if (log_database == NULL) goto err;
 	landing_page = g_key_file_get_string(key, "config", "landing-page", NULL);
 	if (landing_page == NULL) goto err;
+	log_dir = g_key_file_get_string(key, "config", "log-dir", NULL);
+	if (log_dir == NULL)
+		log_dir = g_strdup(LOG_DIR);
 
 	config.port = g_key_file_get_integer(key, "config", "port", NULL);
 	config.cache_port = g_key_file_get_integer(key, "config", "cache-port", NULL);
 	config.filter = g_key_file_get_boolean(key, "config", "filter", NULL);
 	config.log = g_key_file_get_boolean(key, "config", "log", NULL);
 	config.debug = g_key_file_get_boolean(key, "config", "debug", NULL);
+	config.log_file = g_key_file_get_boolean(key, "config", "log-file", NULL);
 	g_key_file_free(key);
 
 	config.host = host;
@@ -842,6 +884,7 @@ int read_config(void)
 	config.cache_host = cache_host;
 	config.log_database = log_database;
 	config.landing_page = landing_page;
+	config.log_dir = log_dir;
 
 	return 1;
 
@@ -1792,7 +1835,7 @@ int write_log(const struct log *log)
 	FILE *fp;
 
 	sprintf(date, "%i-%.2i-%.2i", st->tm_year + 1900, st->tm_mon + 1, st->tm_mday);
-	snprintf(tmp, sizeof(tmp), "%s/cpdns_%s.log", LOG_DIR, date);
+	snprintf(tmp, sizeof(tmp), "%s/cpdns_%s.log", config.log_dir, date);
 
 	fp = fopen(tmp, "a");
 	if (fp == NULL) {
@@ -1803,9 +1846,10 @@ int write_log(const struct log *log)
 
 	sprintf(time_string, "%s_%.2i:%.2i:%.2i", date, 
 		st->tm_hour, st->tm_min, st->tm_sec);
-	ret = snprintf(tmp, sizeof(tmp), "%s %s %s %i %i %i %i %i %i\n", time_string,
-		       log->qname, log->remote, log->qtime, log->ftime, log->blacklist,
-		       log->exist, log->status, backend_id);
+	ret = snprintf(tmp, sizeof(tmp), "%s\t%s\t%i\t%i\t%i\t%i\t%i\t%i\t%s\n", 
+		       time_string, log->remote, log->qtime, log->ftime, 
+		       log->blacklist, log->exist, log->status, backend_id, 
+		       log->qname);
 
 	ret = fwrite(tmp, ret, 1, fp);
 	if (ret <= 0)
@@ -1863,17 +1907,25 @@ int main(void)
 			goto end;
 		}
 
-		/* Sometime PowerDNS ask with asterisk '*' sign, eg '*.com' 
+		/* 
+		 * Sometime PowerDNS ask with asterisk '*' sign, eg '*.com' 
 		 * don't have any idea yet so just discard it.
 		 */
 		if (*q.qname == '*') goto end;
 
-		do_query(&q);
+		switch (do_query(&q)) {
+			case LDNS_RCODE_SERVFAIL:
+				puts("FAIL");
+				if (config.debug)
+					fprintf(stderr, "FAIL\n");
+				break;
 
+			default:
 end:
-		puts("END");
-		if (config.debug)
-			fprintf(stderr, "END\n");
+				puts("END");
+				if (config.debug)
+					fprintf(stderr, "END\n");
+		}
 	}
 
 	return 0;
