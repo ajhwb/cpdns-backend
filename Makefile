@@ -3,10 +3,10 @@
 
 SOURCES       = queue.c backend.c
 OBJS          = $(SOURCES:.c=.o)
-CFLAGS        = -W -Wall -Wno-sign-compare -O3 -g -I${PWD}
+CFLAGS        = -W -Wall -Wno-sign-compare -O3 -I${PWD}
 GLIBCFLAGS    = `pkg-config --cflags glib-2.0`
 GLIBLDFLAGS   = `pkg-config --libs glib-2.0`
-MYSQLLDFLAGS  = -L/usr/lib/mysql -L/usr/lib64/mysql -lmysqlclient
+MYSQLLDFLAGS  = -L/usr/lib/mysql -L/usr/lib64/mysql -lmysqlclient -lpq
 LIBS          = -L/usr/local/lib -lrt -lsqlite3 -lldns -lhiredis
 CC            = gcc
 TARGET        = backend

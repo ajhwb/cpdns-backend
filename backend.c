@@ -2,10 +2,20 @@
  * Cool PowerDNS Backend
  *
  * Copyright (C) 2011 - Ardhan Madras <ajhwb@knac.com>
+ *
+ * This software is free software; you can redistribute it and/or modify it under 
+ * the terms of the GNU General Public License as published by the Free Software 
+ * Foundation; version 2 of the License.
+ *
+ * This software is distributed in the hope that it will be useful, but WITHOUT 
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS 
+ * FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along with 
+ * This software; if not, write to the Free Software Foundation, Inc., 51 Franklin 
+ * St, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#include <arpa/inet.h>
-#include <sys/select.h>
 #include <sys/time.h>
 #include <time.h>
 #include <stdio.h>
@@ -20,7 +30,7 @@
 
 #define MYSQLS		0x00000001
 #define PGSQLS		0x00000002
-#define DB_BACKEND	MYSQLS
+#define DB_BACKEND	PGSQLS
 
 #if DB_BACKEND == MYSQLS
 # include <mysql/mysql.h>
@@ -31,6 +41,7 @@
 #define CONFIG_FILE	"/etc/pdns/backend.conf"
 /* Unique prefix string for each key, example cpdns:x.com ... */
 #define KEY_PREFIX	"cpdns"
+#define LOG_DIR		"/var/log/pdns"
 
 enum type_id {
 	TYPE_ID_Q = 0,
@@ -98,12 +109,19 @@ struct config {
 struct log {
 	long reqtime;     /* Time of query */
 	int qtime;        /* Query time in miliseconds */
+	int ftime;	  /* Filter query time in miliseconds */
 	int blacklist;    /* Blacklist status */
 	int exist;        /* Name exist status */
 	int status;       /* Query status */
 	int qtype;        /* Record type of query */
 	char qname[256];  /* Name to query */
 	char remote[16];  /* Remote client IP */
+};
+
+struct filter_info
+{
+	int status;        /* Filter status */
+	unsigned long id;  /* Client ID */
 };
 
 #define NSEC_PER_SEC	1000000000
@@ -126,12 +144,16 @@ int lookup_cachedb(const struct query*, queue_t**);
 static void print_answer(const struct answer*, FILE*, int);
 static void clear_cachedb(const struct query*);
 void free_cachedb_data(queue_t*);
-static int search_blacklist(const struct query*, queue_t**);
+static int search_blacklist(const struct query*, queue_t**, 
+				struct filter_info*, struct timespec*);
 static int insert_blacklist_data(const struct answer*);
 static int insert_log(const struct log*);
+static int write_log(const struct log*);
 static int init_resolver(void);
 static void insert_cachedb(const struct query*, queue_t*, struct timespec);
 static void close_database(void);
+static void insert_filter_cache(const struct query*, const struct filter_info*);
+static int lookup_filter_cache(const struct query*, struct filter_info*);
 
 
 #define exec_cachedb(cmd) \
@@ -261,7 +283,7 @@ static void set_backend_id(void)
 	clock_gettime(CLOCK_REALTIME, &ts);
 
 	srand(ts.tv_nsec);
-	backend_id = rand();
+	backend_id = rand() % 10000;
 }
 
 struct timespec ts_diff(const struct timespec *start, const struct timespec *end)
@@ -279,6 +301,14 @@ struct timespec ts_diff(const struct timespec *start, const struct timespec *end
 	}
 	ts.tv_nsec = delta;
 	return ts;
+}
+
+static inline long ts2ms(const struct timespec *ts)
+{
+	long retval = ts->tv_nsec / USEC_PER_SEC;
+	retval += (ts->tv_sec * 1000);
+
+	return retval;
 }
 
 const char *type_str(enum rr_type type)
@@ -370,7 +400,8 @@ static int rr2answer(const ldns_rr *rr, struct answer *ans)
 	if (!str)
 		exit(EXIT_FAILURE);
 
-	str_len = strlen(str) - 1;
+	/* Don't manage to remove dot from name, imagine root domain query '.' */
+	str_len = strlen(str);
 	if (str_len < sizeof(result.qname) - 1) {
 		memcpy(result.qname, str, str_len);
 		result.qname[str_len] = 0;
@@ -419,6 +450,7 @@ static int rr2answer(const ldns_rr *rr, struct answer *ans)
 		}
 
 		rr_type = ldns_rr_get_type(rr);
+		result.qtype = rr_type;
 
 		/* MX data doesn't need the MX priority */
 		if (i == 0 && rr_type == LDNS_RR_TYPE_MX) {
@@ -449,7 +481,6 @@ static int rr2answer(const ldns_rr *rr, struct answer *ans)
 	}
 
 	result.data[data_len] = 0;
-	result.qtype = rr_type;
 	result.ttl = ldns_rr_ttl(rr);
 
 	*ans = result;
@@ -518,8 +549,9 @@ int do_query(const struct query *q)
 {
 	queue_t *data, *ptr;
 	struct answer *ans;
-	struct timespec start, end, tm, diff;
+	struct timespec start, end, tm, diff, fdiff;
 	struct log log;
+	struct filter_info fi;
 	int result, rcode;
 	ldns_rdf *rdf;
 	ldns_pkt *pkt;
@@ -534,7 +566,7 @@ int do_query(const struct query *q)
 		 * first, while version 3 is SOA record.
 		 */
 		if (q->qtype_id == RR_TYPE_ANY || q->qtype_id == RR_TYPE_SOA)
-			result = search_blacklist(q, &data);
+			result = search_blacklist(q, &data, &fi, &fdiff);
 
 		if (result > 0) {
 			if (q->qtype_id == RR_TYPE_A || q->qtype_id == RR_TYPE_ANY) {
@@ -555,6 +587,7 @@ int do_query(const struct query *q)
 
 			if (config.log) {
 				log.qtime = 0;
+				log.ftime = 
 				log.blacklist = 1;
 				log.exist = 1;
 				log.status = 0;
@@ -563,6 +596,7 @@ int do_query(const struct query *q)
 				sprintf(log.qname, "%s", q->qname);
 				sprintf(log.remote, "%s", q->remote_ip);
 				insert_log(&log);
+				write_log(&log);
 			}
 
 			free_cachedb_data(data);
@@ -629,10 +663,8 @@ int do_query(const struct query *q)
 
 		if (config.debug) {
 			diff = ts_diff(&start, &end);
-			fprintf(stderr, "<< %s: %i records in %llu ms >>\n", 
-				q->qname, result,
-				((unsigned long long) diff.tv_sec * NSEC_PER_SEC + 
-				diff.tv_nsec) / USEC_PER_SEC);
+			fprintf(stderr, "<< %s: %i records, resolved in %li ms >>\n", 
+				q->qname, result, ts2ms(&diff));
 		}
 
 		if (result > 0) {
@@ -653,7 +685,7 @@ int do_query(const struct query *q)
 	}
 
 	if (rcode != LDNS_RCODE_NOERROR && config.debug)
-		fprintf(stderr, "<< rcode: %i >>\n", rcode);
+		fprintf(stderr, "<< %s: rcode: %i >>\n", q->qname, rcode);
 
 	ldns_pkt_free(pkt);
 	destroy_resolver();
@@ -670,6 +702,7 @@ int do_query(const struct query *q)
 		sprintf(log.qname, "%s", q->qname);
 		sprintf(log.remote, "%s", q->remote_ip);
 		insert_log(&log);
+		write_log(&log);
 	}
 
 	return 0;
@@ -698,35 +731,75 @@ void set_dns_type(const char *qtype, struct query *q)
 int parse_query(char *data, struct query *q)
 {
 	char *ptr = data;
-	char *tmp;
-	int pos = 0, n = 0;
+	char *tmp, *type;
 
-	while ((tmp = strtok(ptr, "\t"))) {
-		if (n == 0) {
-			if (!strcmp("Q", tmp)) q->type_id = TYPE_ID_Q;
-			else if (!strcmp("AXFR", tmp)) q->type_id = TYPE_ID_AXFR;
-			else return 0;
+	/* Query type */
+	if (!(tmp = strchr(ptr, '\t')))
+		return 0;
+	if (!strncmp("Q", ptr, tmp - ptr))
+		q->type_id = TYPE_ID_Q;
+	else if (!strncmp("AXFR", ptr, tmp - ptr)) {
+		q->type_id = TYPE_ID_AXFR;
+		return 1;
+	} else
+		return 0;
 
-		}
-		else if (n == 1) sprintf(q->qname, "%s", tmp);
-		else if (n == 2) {
-			q->qclass_id = QCLASS_ID_IN;
-			sprintf(q->qclass, "%s", tmp);
-		}
-		else if (n == 3) {
-			set_dns_type(tmp, q);
-			sprintf(q->qtype, "%s", tmp);
-		}
-		else if (n == 4) q->id = strtol(tmp, 0, 10);
-		else if (n == 5) snprintf(q->remote_ip, strlen(tmp), "%s", tmp);
-		pos += strlen(tmp) + 1;
-		ptr = data + pos;
-		n++;
+	/* 
+	 * Domain name, PowerDNS doesn't give a '.' for root domain, 
+	 * so we manually detect it :(
+	 */
+	ptr = ++tmp;
+	if (*ptr == '\0')
+		return 0;
+	if (*ptr == '\t')
+		sprintf(q->qname, ".");
+	else {
+		if (!(tmp = strchr(ptr, '\t')))
+			return 0;
+		snprintf(q->qname, tmp - ptr + 1, "%s", ptr);
 	}
 
-	if (q->type_id == TYPE_ID_Q && n < 6)
+	/* Class, actually always 'IN' type */
+	ptr = ++tmp;
+	if (*ptr == '\0')
 		return 0;
-	return n > 1 ? 1 : 0;
+	if (!(tmp = strchr(ptr, '\t')))
+		return 0;
+	if (strncmp("IN", ptr, tmp - ptr))
+		return 0;
+	else {
+		q->qclass_id = QCLASS_ID_IN;
+		snprintf(q->qclass, tmp - ptr + 1, "%s", tmp);
+	}
+
+	/* Record type */
+	ptr = ++tmp;
+	if (*ptr == '\0')
+		return 0;
+	if (!(tmp = strchr(ptr, '\t')))
+		return 0;
+	type = xstrndup(ptr, tmp - ptr);
+	set_dns_type(type, q);
+	sprintf(q->qtype, "%s", type);
+	free(type);
+
+	/* ID */
+	ptr = ++tmp;
+	if (*ptr == '\0')
+		return 0;
+	if (!(tmp = strchr(ptr, '\t')))
+		return 0;
+	type = xstrndup(ptr, tmp - ptr);
+	q->id = strtol(type, NULL, 10);
+	free(type);
+
+	/* Remote IP */
+	ptr = ++tmp;
+	if (*ptr == '\0')
+		return 0;
+	sprintf(q->remote_ip, "%s", ptr);
+
+	return 1;
 }
 
 int read_config(void)
@@ -852,14 +925,32 @@ static void close_database(void)
 }
 
 #if DB_BACKEND == MYSQLS
-static int search_blacklist(const struct query *q, queue_t **blacklist)
+static int search_blacklist(const struct query *q, queue_t **blacklist, 
+		struct filter_info *fi, struct timespec *diff)
 {
 	MYSQL_RES *res;
 	MYSQL_ROW row;
 	char *cmd;
-	int ret, num_rows;
+	int ret, num_rows, num_fields;
+	unsigned long is_block_retval, client_id;
 	struct answer *ans;
+	struct timespec start, end;
 	queue_t *data = NULL;
+
+	clock_gettime(CLOCK_REALTIME, &start);
+/*
+	ret = lookup_filter_cache(q, fi);
+	if (ret) {
+		if (config.debug)
+			fprintf(stderr, "<< %s: filter cache hits >>\n", __func__);
+		clock_gettime(CLOCK_REALTIME, &end);
+		*diff = ts_diff(&start, &end);
+		if (fi->status)
+			goto block;
+		else
+			return 0;
+	}
+*/
 
 	if (connect_database(3) == 0)
 		exit(EXIT_FAILURE);
@@ -869,6 +960,10 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 	if (config.debug)
 		fprintf(stderr, "<< %s >>\n", cmd);
 	ret = mysql_query(my_conn, cmd);
+
+	clock_gettime(CLOCK_REALTIME, &end);
+	*diff = ts_diff(&start, &end);
+
 	sqlite3_free(cmd);
 	if (ret) {
 		fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
@@ -888,19 +983,37 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 		return 0;
 	}
 
-	row = mysql_fetch_row(res);
-	unsigned long is_block_retval = strtoul (*row, NULL, 10);
-
-	if (config.debug)
-		fprintf(stderr, "<< is_block_retval: %lu >>\n", is_block_retval);
-
-	/* No blocking */
-	if (is_block_retval == 0UL) {
+	num_fields = mysql_num_fields(res);
+	if (num_fields < 3) {
+		if (config.debug)
+			fprintf(stderr, "<< %s: only return %i fields, "
+				"expected 3 fields >>\n", __func__, num_fields);
 		mysql_free_result(res);
 		close_database();
-		return 0;
+		return -1;
 	}
 
+	row = mysql_fetch_row(res);
+	is_block_retval = *row ? strtoul (*row, NULL, 10) : 0;
+	client_id = row[2] ? strtoul (row[2], NULL, 10) : 0;
+
+	if (config.debug)
+		fprintf(stderr, "<< %s: retval: %lu >>\n", __func__, is_block_retval);
+
+	mysql_free_result(res);
+	close_database();
+
+	/* No blocking */
+	fi->id = client_id;
+	if (is_block_retval == 0UL) {
+		fi->status = 0;
+		return 0;
+	} else
+		fi->status = 1;
+
+	/* insert_filter_cache(q, fi); */
+
+block:
 	/* Build A and SOA record, PowerDNS need at least SOA 
 	 * and A record to make query answered correctly.
 	 */
@@ -924,12 +1037,8 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 
 	data = queue_prepend(data, ans);
 
-	mysql_free_result(res);
-
 	if (config.debug)
-		fprintf(stderr, "<< %s: record found >>\n", q->qname);
-
-	close_database();
+		fprintf(stderr, "<< %s: record found >>\n", q->qname);;
 
 	*blacklist = data;
 
@@ -938,23 +1047,32 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 #endif
 
 #if DB_BACKEND == PGSQLS
-static int search_blacklist(const struct query *q, queue_t **blacklist)
+static int search_blacklist(const struct query *q, queue_t **blacklist, 
+		struct filter_info *fi, struct timespec *diff)
 {
 	PGresult *res;
 	struct answer *ans;
+	struct timespec start, end;
 	queue_t *data = NULL;
 	char *tmp;
-	int ret, num_rows;
+	int ret;
 
+	ret = lookup_filter_cache(q, fi);
+	if (ret == 1 && fi->status)
+		goto block;
+
+	clock_gettime(CLOCK_REALTIME, &start);
 	if (connect_database(3) == 0)
 		return 0;
 
-	tmp = g_strdup_printf("select check_filter_status('%s', '%s')",
+	tmp = g_strdup_printf("SELECT check_filter_status('%s', '%s')",
 			      q->qname, q->remote_ip);
-	res = PQexec (pg_conn, tmp);
-	g_free (tmp);
+	res = PQexec(pg_conn, tmp);
+	clock_gettime(CLOCK_REALTIME, &end);
+	*diff = ts_diff(&start, &end);
+	g_free(tmp);
 
-	ret = PQresultStatus (res);
+	ret = PQresultStatus(res);
 	if (ret != PGRES_TUPLES_OK) {
 		PQclear(res);
 		close_database();
@@ -970,12 +1088,22 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 			fprintf(stderr, "<< %s: invalid query returns >>\n", __func__);
 	}
 
-	tmp = PQgetvalue (res, 0, 0);
-	if (tmp == NULL || strtol(tmp, NULL, 10) != 2) {
-		PQclear(res);
-		close_database();
+	tmp = PQgetvalue(res, 0, 0);
+	PQclear(res);
+	close_database();
+
+	if (tmp == NULL)
 		return 0;
-	}
+
+	ret = strtol(tmp, NULL, 10);
+	fi->status = ret == 2 ? 0 : 1;
+	fi->id = 0;
+	insert_filter_cache(q, fi);
+
+	if (ret != 2)
+		return 0;
+
+block:
 
 	/* Build A and SOA record, PowerDNS need at least SOA 
 	 * and A record to make query answered correctly.
@@ -1003,12 +1131,9 @@ static int search_blacklist(const struct query *q, queue_t **blacklist)
 	if (config.debug)
 		fprintf(stderr, "<< %s: record found >>\n", q->qname);
 
-	PQclear(res);
-	close_database();
-
 	*blacklist = data;
 
-	return num_rows;
+	return 1;
 }
 #endif
 
@@ -1118,6 +1243,72 @@ static void expire_cachedb_count(const struct query *q, unsigned int ttl)
 }
 #endif
 
+/**
+ * Insert database query result into cache that will be used for next 
+ * query, but cached. This will keep until given TTL is expired then 
+ * new database query requested for the next cache, and so on.
+ */
+static void insert_filter_cache(const struct query *q, const struct filter_info *info)
+{
+	redisReply *reply;
+
+	init_cachedb();
+
+	reply = redisCommand(cachedb_ctx, "DEL %s:filter:%s:%s",
+			     KEY_PREFIX, q->remote_ip, q->qname);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "RPUSH %s:filter:%s:%s %i",
+			     KEY_PREFIX, q->remote_ip, q->qname, info->status);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "RPUSH %s:filter:%s:%s %lu",
+			     KEY_PREFIX, q->remote_ip, q->qname, info->id);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "EXPIRE %s:filter:%s:%s %i",
+			     KEY_PREFIX, q->remote_ip, q->qname, 180);
+
+	destroy_cachedb();
+}
+
+/**
+ * Lookup for filter in cache.
+ * Returns: 1 if found, filter information will be filled in @info.
+ *          0 if not found.
+ */
+static int lookup_filter_cache(const struct query *q, struct filter_info *info)
+{
+	redisReply *reply;
+	int retval = 0;
+
+	init_cachedb();
+
+	reply = redisCommand(cachedb_ctx, "LRANGE %s:filter:%s:%s 0 -1",
+			     KEY_PREFIX, q->remote_ip, q->qname);
+	if (!reply)
+		cachedb_error();
+
+
+	if (reply->type == REDIS_REPLY_ARRAY)
+		if (reply->elements == 2) {
+			info->status = strtol(reply->element[0]->str, NULL, 10);
+			info->id = strtoul(reply->element[1]->str, NULL, 10);
+			retval = 1;
+		}
+
+	freeReplyObject(reply);
+	destroy_cachedb();
+
+	return retval;
+}
+
 static const char * const field_name[5] = {
 	"qname", "type", "ttl", "mxcode", "data"
 };
@@ -1126,10 +1317,15 @@ static const char * const type_name[7] = {
 	"A", "AAAA", "SOA", "NS", "MX", "CNAME", "TXT"
 };
 
-/* Assigning different ttl expire for each key is unsafe, inserting data 
- * to list's key that has expiration will remove all previous data. Also
- * happen with INCR key, value will be set to 1, so don't set expiration 
- * for list or INCR key here, but no problem for set.
+/* 
+ * Assigning different ttl expiration for each key is unsafe, on old 
+ * Redis version, inserting data to list's key that has expiration 
+ * will remove all previous data. Also happen with INCR key, value 
+ * will be set to 1, so don't set expiration for list or INCR key 
+ * here, but no problem for set.
+ *
+ * Key expiration value determined by finding the lowest ttl, then
+ * double the value.
  */
 static void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 {
@@ -1137,18 +1333,22 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 	queue_t *ptr = data;
 	struct answer *a;
 	const char *type_str;
-	unsigned max_ttl = 0, len = 0;
+	unsigned expiration = 0, len = 0;
 	int i;
 
 	init_cachedb();
 
-	/* Find the highest ttl */
+	/* Find the lowest ttl */
 	while (ptr) {
 		a = ptr->data;
-		max_ttl = max_ttl > a->ttl ? max_ttl : a->ttl;
+		if (len == 0)
+			expiration = a->ttl;
+		expiration = expiration > a->ttl ? a->ttl : expiration;
 		ptr = ptr->next;
 		len++;
 	}
+
+	expiration <<= 1;
 
 	ptr = data;
 	while (ptr) {
@@ -1201,7 +1401,7 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 			freeReplyObject(reply);
 
 			reply = redisCommand(cachedb_ctx, "EXPIRE %s:NSMX:%s %li", 
-					     KEY_PREFIX, a->data, max_ttl);
+					     KEY_PREFIX, a->data, expiration);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
@@ -1218,14 +1418,14 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 	freeReplyObject(reply);
 
 	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:time %li", 
-			     KEY_PREFIX, q->qname, max_ttl);
+			     KEY_PREFIX, q->qname, expiration);
 	if (!reply)
 		cachedb_error();
 	freeReplyObject(reply);
 
 	/*
 	 * Set expiration on list specific keys, expiration must be set 
-	 * after all records data has been pushed.
+	 * after all records's data has been pushed.
 	 */
 	ptr = data;
 	while (ptr) {
@@ -1233,14 +1433,14 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 		for (i = 0; i < 5; i++) {
 			reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s:%s %li",
 					     KEY_PREFIX, q->qname, rr2str(a->qtype), 
-					     field_name[i], max_ttl);
+					     field_name[i], expiration);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
 		}
 
 		reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s %li",
-				     KEY_PREFIX, q->qname, rr2str(a->qtype), max_ttl);
+				     KEY_PREFIX, q->qname, rr2str(a->qtype), expiration);
 		if (!reply)
 			cachedb_error();
 		freeReplyObject(reply);
@@ -1255,7 +1455,7 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 	freeReplyObject(reply);
 
 	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %li",
-			     KEY_PREFIX, q->qname, max_ttl);
+			     KEY_PREFIX, q->qname, expiration);
 	if (!reply)
 		cachedb_error();
 	freeReplyObject(reply);
@@ -1342,7 +1542,7 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 	queue_t *data;
 	queue_t *ptr;
 	int nrecords, n, i;
-	unsigned ttl;
+	unsigned ttl, tmp;
 	long tm;
 	struct answer *ans;
 	struct timespec ts;
@@ -1379,10 +1579,14 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 
 	freeReplyObject(*reply);
 
-	if (config.debug)
-		if (nrecords > 0 || n > 0)
+	if (config.debug && (nrecords > 0 || n > 0)) {
+		if (q->qtype_id == RR_TYPE_ANY)
+			fprintf(stderr, "<< %s: cache hits: %i records >>\n",
+				q->qname, nrecords);
+		else
 			fprintf(stderr, "<< %s: cache hits: %i/%i records >>\n",
 				q->qname, nrecords, n);
+	}
 
 	if (n <= 0) {
 		/* Search for possible MX/NS record A or AAAA query */
@@ -1418,9 +1622,26 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 	}
 
 	nrecords = n;
-	ttl = 0;
+	ttl = 86400;
 	data = NULL;
 
+	/* Iterate over records ttl's field to determine lowest ttl value */
+	for (i = 0; i < 7; i++) {
+		*reply = redisCommand(cachedb_ctx, "LRANGE %s:%s:%s:%s 0 -1",
+				      KEY_PREFIX, q->qname, type_name[i], 
+				      field_name[2]);
+		if (*reply == NULL)
+			cachedb_error();
+
+		for (n = 0; n < reply[0]->elements; n++) {
+			tmp = atol(reply[0]->element[n]->str);
+			ttl = ttl > tmp ? tmp : ttl;
+		}
+
+		freeReplyObject(*reply);
+	}
+
+	/* Insert queue's data with cache records */
 	if (q->qtype_id == RR_TYPE_ANY) {
 
 		for (i = 0; i < 7; i++) {
@@ -1441,13 +1662,7 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 				ans->ttl = atol(reply[2]->element[n]->str);
 				ans->mx_code = atoi(reply[3]->element[n]->str);
 				strcpy(ans->data, reply[4]->element[n]->str);
-
 				data = queue_prepend(data, ans);
-
-				if (i == 0 && n == 0)
-					ttl = ans->ttl;
-				else
-					ttl = ttl > ans->ttl ? ans->ttl : ttl;
 			}
 
 			for (n = 0; n < 5; n++)
@@ -1470,13 +1685,7 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 			ans->ttl = atol(reply[2]->element[n]->str);
 			ans->mx_code = atoi(reply[3]->element[n]->str);
 			strcpy(ans->data, reply[4]->element[n]->str);
-
 			data = queue_prepend(data, ans);
-
-			if (n == 0)
-				ttl = ans->ttl;
-			else
-				ttl = ttl > ans->ttl ? ans->ttl : ttl;
 		}
 
 		for (n = 0; n < 5; n++)
@@ -1500,9 +1709,13 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 			a->ttl -= ts.tv_sec - tm;
 			ptr = ptr->next;
 		}
+		if (config.debug)
+			fprintf(stderr, "<< %s: expire in %li s >>\n", 
+				q->qname, ttl - (ts.tv_sec - tm));
 	} else {
 		if (config.debug)
-			fprintf(stderr, "<< %s: cache was expired >>\n", q->qname);
+			fprintf(stderr, "<< %s: cache was expired, min ttl: "
+				"%i s >>\n", q->qname, ttl);
 		free_cachedb_data(data);
 		destroy_cachedb();
 		return 0;
@@ -1548,9 +1761,9 @@ int insert_log(const struct log *log)
 				st->tm_hour, st->tm_min, st->tm_sec);
 
 	cmd = sqlite3_mprintf("INSERT INTO %i_%.2i VALUES(NULL, '%q', '%q', "
-				"'%q', '%q', %i, %i, %i, %i)", st->tm_year + 1900,
+				"'%q', '%q', %i, %i, %i, %i, %i)", st->tm_year + 1900,
 				st->tm_mon + 1, reqtime, log->remote, log->qname, 
-				type_str(log->qtype), log->qtime, 
+				type_str(log->qtype), log->qtime, log->ftime,
 				log->blacklist, log->exist, log->status);
 
 	ret = mysql_query(conn, cmd);
@@ -1565,6 +1778,42 @@ int insert_log(const struct log *log)
 	}
 
 	return 1;
+}
+
+/*
+ * Log format:
+ * YYYY-MM-DD_HH:MM:SS ip domain qtime ftime isblock isexist status
+ */
+int write_log(const struct log *log)
+{
+	struct tm *st = localtime(&log->reqtime);
+	static char date[11], tmp[BUFSIZ], time_string[20];
+	int ret;
+	FILE *fp;
+
+	sprintf(date, "%i-%.2i-%.2i", st->tm_year + 1900, st->tm_mon + 1, st->tm_mday);
+	snprintf(tmp, sizeof(tmp), "%s/cpdns_%s.log", LOG_DIR, date);
+
+	fp = fopen(tmp, "a");
+	if (fp == NULL) {
+		if (config.debug)
+			fprintf(stderr, "<< could not open log file >>\n");
+		return 0;
+	}
+
+	sprintf(time_string, "%s_%.2i:%.2i:%.2i", date, 
+		st->tm_hour, st->tm_min, st->tm_sec);
+	ret = snprintf(tmp, sizeof(tmp), "%s %s %s %i %i %i %i %i %i\n", time_string,
+		       log->qname, log->remote, log->qtime, log->ftime, log->blacklist,
+		       log->exist, log->status, backend_id);
+
+	ret = fwrite(tmp, ret, 1, fp);
+	if (ret <= 0)
+		if (config.debug)
+			fprintf(stderr, "<< could not write log file >>\n");
+
+	fclose(fp);
+	return ret;
 }
 
 int main(void)
