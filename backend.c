@@ -550,7 +550,7 @@ static int process_result(const ldns_pkt *pkt, queue_t **result)
  */
 int do_query(const struct query *q)
 {
-	queue_t *data, *ptr;
+	queue_t *data = NULL, *sorted_data = NULL, *ptr;
 	struct answer *ans;
 	struct timespec start, end, tm, diff, fdiff;
 	struct log log;
@@ -689,8 +689,8 @@ int do_query(const struct query *q)
 
 		if (result > 0) {
 			clear_cachedb(q);
-			queue_sort(data, sort_cachedb_func);
-			insert_cachedb(q, data, tm);
+			sorted_data = queue_sort(data, sort_cachedb_func);
+			insert_cachedb(q, sorted_data, tm);
 		}
 
 		if (config.debug)
@@ -698,7 +698,7 @@ int do_query(const struct query *q)
 				"ms >>\n", q->qname, result, ts2ms(&diff));
 
 		if (result > 0) {
-			ptr = data;
+			ptr = sorted_data;
 			while (ptr) {
 				ans = ptr->data;
 				if (ans->qtype == q->qtype_id ||
@@ -1101,8 +1101,14 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	int ret;
 
 	ret = lookup_filter_cache(q, fi);
-	if (ret == 1 && fi->status)
-		goto block;
+	if (ret == 1) {
+		diff->tv_sec = 0;
+		diff->tv_nsec = 0;
+		if (fi->status)
+			goto block;
+		else
+			return 0;
+	}
 
 	clock_gettime(CLOCK_REALTIME, &start);
 	if (connect_database(3) == 0)
@@ -1139,7 +1145,7 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 		return 0;
 
 	ret = strtol(tmp, NULL, 10);
-	fi->status = ret == 2 ? 0 : 1;
+	fi->status = ret == 2 ? 1 : 0;
 	fi->id = 0;
 	insert_filter_cache(q, fi);
 
@@ -1157,7 +1163,7 @@ block:
 	strcpy(ans->qname, q->qname);
 	strcpy(ans->data, config.landing_page);
 	ans->qtype = RR_TYPE_A;
-	ans->ttl = 3600;
+	ans->ttl = 0;
 
 	data = queue_prepend(data, ans);
 
@@ -1167,7 +1173,7 @@ block:
 	strcpy(ans->data, "ns1.kdns.com dns-admin.kdns.com "
 	       "2011101100 7200 1800 1209600 300");
 	ans->qtype = RR_TYPE_SOA;
-	ans->ttl = 3600;
+	ans->ttl = 0;
 
 	data = queue_prepend(data, ans);
 
@@ -1771,6 +1777,7 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 	return 1;
 }
 
+#if DB_BACKEND == MYSQLS
 int insert_log(const struct log *log)
 {
 	struct tm *st;
@@ -1822,6 +1829,15 @@ int insert_log(const struct log *log)
 
 	return 1;
 }
+#endif
+
+#if DB_BACKEND == PGSQLS
+int insert_log(const struct log *log)
+{
+	(void) log;
+	return 0;
+}
+#endif
 
 /*
  * Log format:
@@ -1846,12 +1862,11 @@ int write_log(const struct log *log)
 
 	sprintf(time_string, "%s_%.2i:%.2i:%.2i", date, 
 		st->tm_hour, st->tm_min, st->tm_sec);
-	ret = snprintf(tmp, sizeof(tmp), "%s\t%s\t%i\t%i\t%i\t%i\t%i\t%i\t%s\n", 
-		       time_string, log->remote, log->qtime, log->ftime, 
-		       log->blacklist, log->exist, log->status, backend_id, 
-		       log->qname);
+	snprintf(tmp, sizeof(tmp), "%s\t%s\t%i\t%i\t%i\t%i\t%i\t%i\t%s\n", 
+		time_string, log->remote, log->qtime, log->ftime, log->blacklist, 
+		log->exist, log->status, backend_id, log->qname);
 
-	ret = fwrite(tmp, ret, 1, fp);
+	ret = fprintf(fp, tmp);
 	if (ret <= 0)
 		if (config.debug)
 			fprintf(stderr, "<< could not write log file >>\n");

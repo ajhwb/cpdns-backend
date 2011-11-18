@@ -1,4 +1,4 @@
-docs/
 *.o
+a.out
+Makefile
 backend
-test
