@@ -208,7 +208,7 @@ char *xstrndup(const char *src, int len)
 	char *dst = malloc(l + 1);
 
 	if (dst != NULL) {
-		memcpy(dst, src, len);
+		memcpy(dst, src, l);
 		*(dst + l) = 0;
 	}
 	return dst;
