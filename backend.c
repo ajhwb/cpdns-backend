@@ -26,11 +26,14 @@
 #include <glib.h>
 #include <hiredis/hiredis.h>
 #include <ldns/ldns.h>
-#include <queue.h>
+
+#include "queue.h"
+#include "regdom.h"
+#include "tld-canon.h"
 
 #define MYSQLS		0x00000001
 #define PGSQLS		0x00000002
-#define DB_BACKEND	PGSQLS
+#define DB_BACKEND	MYSQLS
 
 #if DB_BACKEND == MYSQLS
 # include <mysql/mysql.h>
@@ -132,6 +135,7 @@ struct filter_info
 static redisContext *cachedb_ctx;
 static ldns_resolver *resolver;
 sqlite3 *cachedb;
+static tldnode *tld_node;
 static struct config config;
 static int backend_id;
 
@@ -156,6 +160,7 @@ static void insert_cachedb(const struct query*, queue_t*, struct timespec);
 static void close_database(void);
 static void insert_filter_cache(const struct query*, const struct filter_info*);
 static int lookup_filter_cache(const struct query*, struct filter_info*);
+static int is_www(const char*, tldnode*);
 
 
 #define exec_cachedb(cmd) \
@@ -201,6 +206,8 @@ do { \
 	} \
 	ptr; \
 })
+
+#define pass_www(name)	((name) + 4)
 
 char *xstrndup(const char *src, int len)
 {
@@ -272,6 +279,22 @@ static int init_resolver(void)
 static void destroy_resolver(void)
 {
 	ldns_resolver_deep_free(resolver);
+}
+
+static void init_tldnode(void)
+{
+	extern char *tldString;
+
+	tld_node = readTldTree(tldString);
+	if (!tld_node) {
+		fprintf(stderr, "<< could not initialize tldnode >>\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+static void free_tldnode(void)
+{
+	freeTldTree(tld_node);
 }
 
 static void set_backend_id(void)
@@ -560,6 +583,10 @@ int do_query(const struct query *q)
 	ldns_pkt *pkt;
 
 
+	if (config.debug)
+		fprintf(stderr, "<< filtered name: %s >>\n", 
+			is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname);
+
 	memset(&fdiff, 0, sizeof(struct timespec));
 	if (config.filter) {
 		result = 0;
@@ -615,7 +642,6 @@ int do_query(const struct query *q)
 			return LDNS_RCODE_NOERROR;
 		}
 	}
-
 
 	result = lookup_cachedb(q, &data);
 	if (result > 0) {
@@ -899,6 +925,37 @@ err:
 	return 0;
 }
 
+/*
+ * Determine if domain prefixed by a WWW, it doesn't care if it 
+ * stands for prefix or a subdomain.
+ */
+static int is_www(const char *domain, tldnode *tld)
+{
+	char *name;
+	register int i;
+
+	if (strlen(domain) < 4)
+		return 0;
+	for (i = 0; i < 3; i++)
+		if (domain[i] != 'w' && domain[i] != 'W')
+			return 0;
+	if (domain[i] != '.')
+		return 0;
+
+	name = getRegisteredDomain((char*) domain, tld);
+	if (name == NULL)
+		return -1;
+
+	if (strlen(name) < 4)
+		return 0;
+	for (i = 0; i < 3; i++)
+		if (name[i] != 'w' && name[i] != 'W')
+			return 1;
+	if (name[i] != '.')
+		return 1;
+	return 0;
+}
+
 #if DB_BACKEND == MYSQLS
 static inline int connect_database_mysql(unsigned int timeout)
 {
@@ -998,7 +1055,8 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	if (connect_database(3) == 0)
 		exit(EXIT_FAILURE);
 
-	cmd = sqlite3_mprintf("call is_block('%q', '%q')", q->remote_ip, q->qname);
+	cmd = sqlite3_mprintf("call is_block('%q', '%q')", q->remote_ip, 
+		is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname);
 
 	if (config.debug)
 		fprintf(stderr, "<< %s >>\n", cmd);
@@ -1882,6 +1940,7 @@ int main(void)
 	char tmp_buffer[BUFSIZ];
 
 	set_backend_id();
+	init_tldnode();
 
 	if (read_config() == 0) {
 		fprintf(stderr, "<< could not parse configuration file >>\n");
@@ -1942,6 +2001,8 @@ end:
 					fprintf(stderr, "END\n");
 		}
 	}
+
+	free_tldnode();
 
 	return 0;
 }

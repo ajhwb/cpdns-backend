@@ -1,12 +1,12 @@
 # Custom PowerDNS Backend
 # Copyright (C) 2011 - Ardhan Madras <ajhwb@knac.com>
 
-SOURCES       = queue.c backend.c
+SOURCES       = queue.c regdom.c backend.c
 OBJS          = $(SOURCES:.c=.o)
 CFLAGS        = -W -Wall -Wno-sign-compare -O3 -g -I${PWD}
 GLIBCFLAGS    = `pkg-config --cflags glib-2.0`
 GLIBLDFLAGS   = `pkg-config --libs glib-2.0`
-MYSQLLDFLAGS  = -L/usr/lib/mysql -L/usr/lib64/mysql -lmysqlclient
+MYSQLLDFLAGS  = `mysql_config --libs`
 LIBS          = -L/usr/local/lib -lrt -lsqlite3 -lldns -lhiredis -lpq
 CC            = gcc
 TARGET        = backend
@@ -14,7 +14,7 @@ DEST          = /etc/pdns/
 
 ${TARGET}: ${OBJS}
 	@echo ' [LD]  ${OBJS} ${TARGET}'
-	@${CC} ${GLIBLDFLAGS} ${LIBS} \
+	@${CC} ${GLIBLDFLAGS} ${LIBS} ${MYSQLLDFLAGS} \
 		-o ${TARGET} ${OBJS}
 
 .c.o:
