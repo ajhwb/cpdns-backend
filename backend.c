@@ -1032,13 +1032,13 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	MYSQL_ROW row;
 	static char cmd[256];
 	int ret, num_rows, num_fields;
+	int is_www_retval;
 	unsigned long is_block_retval;
 	struct answer *ans;
 	struct timespec start, end;
 	queue_t *data = NULL;
 
 	clock_gettime(CLOCK_REALTIME, &start);
-
 	ret = lookup_filter_cache(q, fi);
 	if (ret) {
 		if (config.debug)
@@ -1051,11 +1051,15 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 			return 0;
 	}
 
+	is_www_retval = is_www(q->qname, tld_node);
+
+	clock_gettime(CLOCK_REALTIME, &start);
+
 	if (connect_database(3) == 0)
 		exit(EXIT_FAILURE);
 
 	sprintf(cmd, "select check_filter_status('%s', '%s')", 
-		is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname,
+		is_www_retval == 1 ? pass_www(q->qname) : q->qname,
 		q->remote_ip);
 
 	ret = mysql_query(my_conn, cmd);
