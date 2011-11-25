@@ -1030,6 +1030,125 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 {
 	MYSQL_RES *res;
 	MYSQL_ROW row;
+	static char cmd[256];
+	int ret, num_rows, num_fields;
+	unsigned long is_block_retval;
+	struct answer *ans;
+	struct timespec start, end;
+	queue_t *data = NULL;
+
+	clock_gettime(CLOCK_REALTIME, &start);
+
+	ret = lookup_filter_cache(q, fi);
+	if (ret) {
+		if (config.debug)
+			fprintf(stderr, "<< %s: filter cache hits >>\n", __func__);
+		clock_gettime(CLOCK_REALTIME, &end);
+		*diff = ts_diff(&start, &end);
+		if (fi->status)
+			goto block;
+		else
+			return 0;
+	}
+
+	if (connect_database(3) == 0)
+		exit(EXIT_FAILURE);
+
+	sprintf(cmd, "select check_filter_status('%s', '%s')", 
+		is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname,
+		q->remote_ip);
+
+	ret = mysql_query(my_conn, cmd);
+
+	clock_gettime(CLOCK_REALTIME, &end);
+	*diff = ts_diff(&start, &end);
+
+	if (ret) {
+		fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
+		close_database();
+		return -1;
+	}
+
+	res = mysql_store_result(my_conn);
+	if (!res) {
+		close_database();
+		return 0;
+	}
+
+	num_rows = mysql_num_rows(res);
+	if (num_rows <= 0) {
+		close_database();
+		return 0;
+	}
+
+	num_fields = mysql_num_fields(res);
+	if (num_fields < 1) {
+		if (config.debug)
+			fprintf(stderr, "<< %s: expected 1 field >>\n", __func__);
+		mysql_free_result(res);
+		close_database();
+		return -1;
+	}
+
+	row = mysql_fetch_row(res);
+	is_block_retval = *row ? strtoul (*row, NULL, 10) : 0;
+
+	if (config.debug)
+		fprintf(stderr, "<< %s: status: %lu >>\n", __func__, is_block_retval);
+
+	mysql_free_result(res);
+	close_database();
+
+	/* No blocking */
+	fi->id = 0;
+	if (is_block_retval == 2)
+		fi->status = 1;
+	else
+		fi->status = 0;
+
+	insert_filter_cache(q, fi);
+	if (!fi->status)
+		return 0;
+
+block:
+	/* Build A and SOA record, PowerDNS need at least SOA 
+	 * and A record to make query answered correctly.
+	 */
+
+	ans = xmalloc(sizeof(struct answer));
+
+	strcpy(ans->qname, q->qname);
+	strcpy(ans->data, config.landing_page);
+	ans->qtype = RR_TYPE_A;
+	ans->ttl = 0;
+
+	data = queue_prepend(data, ans);
+
+	ans = xmalloc(sizeof(struct answer));
+
+	strcpy(ans->qname, q->qname);
+	strcpy(ans->data, "ns1.kdns.com dns.kdns.com "
+	       "2011052500 28800 7200 604800 86400");
+	ans->qtype = RR_TYPE_SOA;
+	ans->ttl = 3600;
+
+	data = queue_prepend(data, ans);
+
+	if (config.debug)
+		fprintf(stderr, "<< %s: record found >>\n", q->qname);;
+
+	*blacklist = data;
+
+	return 1;
+}
+#endif
+
+#if DB_BACKEND == MYSQLS_
+static int search_blacklist(const struct query *q, queue_t **blacklist, 
+		struct filter_info *fi, struct timespec *diff)
+{
+	MYSQL_RES *res;
+	MYSQL_ROW row;
 	char *cmd;
 	int ret, num_rows, num_fields;
 	unsigned long is_block_retval, client_id;
@@ -1124,7 +1243,7 @@ block:
 	strcpy(ans->qname, q->qname);
 	strcpy(ans->data, config.landing_page);
 	ans->qtype = RR_TYPE_A;
-	ans->ttl = 3600;
+	ans->ttl = 0;
 
 	data = queue_prepend(data, ans);
 

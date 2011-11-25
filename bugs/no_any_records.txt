@@ -1,0 +1,21 @@
+soso.com has no any record, but has SOA, A and MX record
+
+Q	soso.com	IN	SOA	-1	125.161.226.107 [ID:1611]
+<< filtered name: soso.com >>
+<< search_blacklist: status: 0 >>
+<< soso.com: 0 records, resolved in 21 ms >>
+END
+Q	com	IN	SOA	-1	125.161.226.107 [ID:1611]
+<< filtered name: com >>
+<< search_blacklist: status: 0 >>
+<< com: 14 records, resolved in 89 ms >>
+DATA	com	IN	SOA	522	1	a.gtld-servers.net nstld.verisign-grs.com 1322250438 1800 900 604800 86400 [ID:1611]
+END
+Q	soso.com	IN	ANY	1	125.161.226.107 [ID:1611]
+<< filtered name: soso.com >>
+<< search_blacklist: filter cache hits >>
+<< soso.com: 0 records, resolved in 19 ms >>
+END
+Q	*.com	IN	ANY	1	125.161.226.107 [ID:1611]
+END
+
