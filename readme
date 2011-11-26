@@ -14,8 +14,7 @@ currently it can do these following task.
 To build this you will need these following libraries:
 
 - hiredis, https://github.com/antirez/hiredis
-- MySQL http://mysql.org (if used with MySQL)
-- PostgreSQL, http://postgresql.org (if used with PostgreSQL)
+- MySQL http://mysql.org
 - ldns, http://www.nlnetlabs.nl/projects/ldns/
 - Glib, http://gtk.org
 
