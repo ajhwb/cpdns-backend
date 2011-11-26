@@ -3,7 +3,7 @@
 
 SOURCES       = queue.c regdom.c backend.c
 OBJS          = $(SOURCES:.c=.o)
-CFLAGS        = -W -Wall -Wno-sign-compare -O3 -g -I${PWD}
+CFLAGS        = -W -Wall -Wno-sign-compare -O3 -g -I${PWD} -D_KDNS
 GLIBCFLAGS    = `pkg-config --cflags glib-2.0`
 GLIBLDFLAGS   = `pkg-config --libs glib-2.0`
 MYSQLLDFLAGS  = `mysql_config --libs`
