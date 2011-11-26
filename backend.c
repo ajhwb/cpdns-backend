@@ -1327,6 +1327,11 @@ static const char * const type_name[7] = {
  *
  * Key expiration value determined by finding the lowest ttl, then
  * double the value.
+ *
+ * As this program may be spawned by PowerDNS in many instances,
+ * race condition evil may come on each transaction. Here we use 
+ * optmistic locking routine, this features require at least 
+ * version 2.2 of Redis.
  */
 static void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 {
@@ -1334,7 +1339,7 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 	queue_t *ptr = data;
 	struct answer *a;
 	const char *type_str;
-	unsigned expiration = 0, len = 0;
+	unsigned expiration = 0;
 	int i;
 
 	init_cachedb();
@@ -1342,14 +1347,23 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 	/* Find the lowest ttl */
 	while (ptr) {
 		a = ptr->data;
-		if (len == 0)
+		if (ptr == data)
 			expiration = a->ttl;
 		expiration = expiration > a->ttl ? a->ttl : expiration;
 		ptr = ptr->next;
-		len++;
 	}
 
 	expiration <<= 1;
+
+	reply = redisCommand(cachedb_ctx, "WATCH %s:%s", KEY_PREFIX, q->qname);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "MULTI");
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
 
 	ptr = data;
 	while (ptr) {
@@ -1390,6 +1404,12 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 
 		reply = redisCommand(cachedb_ctx, "INCR %s:%s:%s", 
 				     KEY_PREFIX, q->qname, type_str);
+		if (!reply)
+			cachedb_error();
+		freeReplyObject(reply);
+
+		/* Increase qname counter, it is watched for locking */
+		reply = redisCommand(cachedb_ctx, "INCR %s:%s", KEY_PREFIX, q->qname);
 		if (!reply)
 			cachedb_error();
 		freeReplyObject(reply);
@@ -1449,16 +1469,19 @@ static void insert_cachedb(const struct query *q, queue_t *data, struct timespec
 		ptr = ptr->next;
 	}
 
-	/* Set qname counter and its expiration */
-	reply = redisCommand(cachedb_ctx, "SET %s:%s %u", KEY_PREFIX, q->qname, len);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-
+	/* Set qname expiration */
 	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %li",
 			     KEY_PREFIX, q->qname, expiration);
 	if (!reply)
 		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "EXEC");
+	if (!reply)
+		cachedb_error();
+	if (config.debug && reply->type == REDIS_REPLY_NIL)
+		fprintf(stderr, "<< %s: exec reply nil, possible due "
+			"optimistic locking >>\n", __func__);
 	freeReplyObject(reply);
 
 	destroy_cachedb();
