@@ -745,11 +745,13 @@ int parse_query(char *data, struct query *q)
 	/* Query type */
 	if (!(tmp = strchr(ptr, '\t')))
 		return 0;
+	if (tmp - ptr <= 0)
+		return 0;
 	if (!strncmp("Q", ptr, tmp - ptr))
 		q->type_id = TYPE_ID_Q;
 	else if (!strncmp("AXFR", ptr, tmp - ptr)) {
 		q->type_id = TYPE_ID_AXFR;
-		return 1;
+		return 0;
 	} else
 		return 0;
 
@@ -765,6 +767,8 @@ int parse_query(char *data, struct query *q)
 	else {
 		if (!(tmp = strchr(ptr, '\t')))
 			return 0;
+		if (tmp - ptr <= 0)
+			return 0;
 		type = xstrndup(ptr, tmp - ptr);
 		sprintf(q->qname, "%s", type);
 		free(type);
@@ -775,6 +779,8 @@ int parse_query(char *data, struct query *q)
 	if (*ptr == '\0')
 		return 0;
 	if (!(tmp = strchr(ptr, '\t')))
+		return 0;
+	if (tmp - ptr <= 0)
 		return 0;
 	if (strncmp("IN", ptr, tmp - ptr))
 		return 0;
@@ -789,6 +795,8 @@ int parse_query(char *data, struct query *q)
 		return 0;
 	if (!(tmp = strchr(ptr, '\t')))
 		return 0;
+	if (tmp - ptr <= 0)
+		return 0;
 	type = xstrndup(ptr, tmp - ptr);
 	set_dns_type(type, q);
 	sprintf(q->qtype, "%s", type);
@@ -800,6 +808,8 @@ int parse_query(char *data, struct query *q)
 		return 0;
 	if (!(tmp = strchr(ptr, '\t')))
 		return 0;
+	if (tmp - ptr <= 0)
+		return 0;
 	type = xstrndup(ptr, tmp - ptr);
 	q->id = strtol(type, NULL, 10);
 	free(type);
@@ -809,6 +819,8 @@ int parse_query(char *data, struct query *q)
 	if (*ptr == '\0')
 		return 0;
 	if (!(tmp = strchr(ptr, '\n')))
+		return 0;
+	if (tmp - ptr <= 0)
 		return 0;
 	snprintf(q->remote_ip, tmp - ptr + 1, "%s", ptr);
 
