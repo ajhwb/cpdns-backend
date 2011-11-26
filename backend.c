@@ -22,7 +22,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <mysql/mysql.h>
-#include <sqlite3.h>
 #include <glib.h>
 #include <hiredis/hiredis.h>
 #include <ldns/ldns.h>
@@ -134,7 +133,6 @@ struct filter_info
 
 static redisContext *cachedb_ctx;
 static ldns_resolver *resolver;
-sqlite3 *cachedb;
 static tldnode *tld_node;
 static struct config config;
 static int backend_id;
@@ -152,7 +150,6 @@ static void clear_cachedb(const struct query*);
 void free_cachedb_data(queue_t*);
 static int search_blacklist(const struct query*, queue_t**, 
 				struct filter_info*, struct timespec*);
-static int insert_blacklist_data(const struct answer*);
 static int insert_log(const struct log*);
 static int write_log(const struct log*);
 static int init_resolver(void);
@@ -162,19 +159,6 @@ static void insert_filter_cache(const struct query*, const struct filter_info*);
 static int lookup_filter_cache(const struct query*, struct filter_info*);
 static int is_www(const char*, tldnode*);
 
-
-#define exec_cachedb(cmd) \
-do { \
-	int ret = sqlite3_exec(cachedb, cmd, 0, 0, 0); \
-	if (ret != SQLITE_OK) { \
-		fprintf(stderr, "<< %s: %i: %s >>\n", __func__, \
-			sqlite3_errcode(cachedb), sqlite3_errmsg(cachedb)); \
-		if (sqlite3_errcode(cachedb) != 1) { \
-			fprintf(stderr, "<< aborting >>\n"); \
-			exit(EXIT_FAILURE); \
-		} \
-	} \
-} while (0);
 
 #define cachedb_error() \
 do { \
@@ -373,26 +357,6 @@ static void print_answer(const struct answer *ans, FILE *fp, int cached)
 	} else {
 		fprintf(stdout, "%s\n", buffer);
 	}
-}
-
-void process_blacklist(const struct query *q, const struct answer *blacklist_ans)
-{
-	queue_t *cache_data = NULL, *ptr;
-	struct answer *ans;
-
-	insert_blacklist_data(blacklist_ans);
-	lookup_cachedb(q, &cache_data);
-	ptr = cache_data;
-
-	while (ptr != NULL) {
-		ans = ptr->data;
-		print_answer(ans, stdout, 0);
-		if (config.debug)
-			print_answer(ans, stderr, 0);
-		ptr = ptr->next;
-	}
-
-	free_cachedb_data(cache_data);
 }
 
 static int rr2answer(const ldns_rr *rr, struct answer *ans)
@@ -1153,7 +1117,7 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 {
 	MYSQL_RES *res;
 	MYSQL_ROW row;
-	char *cmd;
+	static char cmd[256];
 	int ret, num_rows, num_fields;
 	unsigned long is_block_retval, client_id;
 	struct answer *ans;
@@ -1178,7 +1142,7 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	if (connect_database(3) == 0)
 		exit(EXIT_FAILURE);
 
-	cmd = sqlite3_mprintf("call is_block('%q', '%q')", q->remote_ip, 
+	sprintf(cmd, "call is_block('%q', '%q')", q->remote_ip, 
 		is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname);
 
 	if (config.debug)
@@ -1188,7 +1152,6 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	clock_gettime(CLOCK_REALTIME, &end);
 	*diff = ts_diff(&start, &end);
 
-	sqlite3_free(cmd);
 	if (ret) {
 		fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
 		close_database();
@@ -1366,48 +1329,6 @@ block:
 	return 1;
 }
 #endif
-
-static int insert_blacklist_data(const struct answer *ans)
-{
-	char *cmd;
-	int ret;
-
-	cmd = sqlite3_mprintf("INSERT INTO cache VALUES(NULL, '%q', %i, %i, "
-				"'%q', %i, '%q')", ans->qname, RR_TYPE_A, 3600,
-				"", 0, ans->data);
-	ret = sqlite3_exec(cachedb, cmd, NULL, NULL, NULL);
-	sqlite3_free(cmd);
-	if (ret != SQLITE_OK) return 0;
-
-	cmd = sqlite3_mprintf("INSERT INTO cache VALUES(NULL, '%q', %i, %i, "
-				"'%q', %i, '%q')", ans->qname, RR_TYPE_SOA, 3600,
-				"", 0, "ns1.amaladns.com dns.amala.net "
-				"2011052500 28800 7200 604800 86400");
-	ret = sqlite3_exec(cachedb, cmd, NULL, NULL, NULL);
-	sqlite3_free(cmd);
-	if (ret != SQLITE_OK) return 0;
-
-	cmd = sqlite3_mprintf("INSERT INTO cache VALUES(NULL, '%q', %i, %i, "
-				"'%q', %i, '%q')", ans->qname, RR_TYPE_NS, 3600,
-				"", 0, "ns1.amaladns.com");
-	ret = sqlite3_exec(cachedb, cmd, NULL, NULL, NULL);
-	sqlite3_free(cmd);
-	if (ret != SQLITE_OK) return 0;
-
-	cmd = sqlite3_mprintf("INSERT INTO cache VALUES(NULL, '%q', %i, %i, "
-				"'%q', %i, '%q')", ans->qname, RR_TYPE_MX, 3600,
-				"", 0, "mail.amaladns.com");
-	ret = sqlite3_exec(cachedb, cmd, NULL, NULL, NULL);
-	sqlite3_free(cmd);
-	if (ret != SQLITE_OK) return 0;
-
-	cmd = sqlite3_mprintf("INSERT INTO cache VALUES(NULL, '%q', %i, %i, "
-				"'%q', %i, '%q')", ans->qname, RR_TYPE_TXT, 3600,
-				"", 0, "AmalaDNS by LINKIT360");
-	ret = sqlite3_exec(cachedb, cmd, NULL, NULL, NULL);
-	sqlite3_free(cmd);
-	return 1;
-}
 
 void init_cachedb(void)
 {
@@ -1962,7 +1883,8 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 int insert_log(const struct log *log)
 {
 	struct tm *st;
-	char *cmd, *reqtime;
+	char *reqtime;
+	static char cmd[256];
 	int ret;
 
 	MYSQL *conn;
@@ -1991,15 +1913,14 @@ int insert_log(const struct log *log)
 				st->tm_year + 1900, st->tm_mon + 1, st->tm_mday,
 				st->tm_hour, st->tm_min, st->tm_sec);
 
-	cmd = sqlite3_mprintf("INSERT INTO %i_%.2i VALUES(NULL, '%q', '%q', "
-				"'%q', '%q', %i, %i, %i, %i, %i)", st->tm_year + 1900,
-				st->tm_mon + 1, reqtime, log->remote, log->qname, 
-				type_str(log->qtype), log->qtime, log->ftime,
-				log->blacklist, log->exist, log->status);
+	sprintf(cmd, "INSERT INTO %i_%.2i VALUES(NULL, '%s', '%s', "
+		"'%s', '%s', %i, %i, %i, %i, %i)", st->tm_year + 1900,
+		st->tm_mon + 1, reqtime, log->remote, log->qname, 
+		type_str(log->qtype), log->qtime, log->ftime,
+		log->blacklist, log->exist, log->status);
 
 	ret = mysql_query(conn, cmd);
 	g_free(reqtime);
-	sqlite3_free(cmd);
 
 	mysql_close(conn);
 
