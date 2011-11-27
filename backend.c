@@ -1273,6 +1273,17 @@ static void insert_filter_cache(const struct query *q, const struct filter_info 
 		cachedb_error();
 	freeReplyObject(reply);
 
+	reply = redisCommand(cachedb_ctx, "WATCH %s:filter:%s:%s",
+			     KEY_PREFIX, q->remote_ip, q->qname);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "MULTI");
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
 	reply = redisCommand(cachedb_ctx, "RPUSH %s:filter:%s:%s %i",
 			     KEY_PREFIX, q->remote_ip, q->qname, info->status);
 	if (!reply)
@@ -1287,6 +1298,15 @@ static void insert_filter_cache(const struct query *q, const struct filter_info 
 
 	reply = redisCommand(cachedb_ctx, "EXPIRE %s:filter:%s:%s %i",
 			     KEY_PREFIX, q->remote_ip, q->qname, 180);
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "EXEC");
+	if (!reply)
+		cachedb_error();
+	if (config.debug && reply->type == REDIS_REPLY_NIL)
+		fprintf(stderr, "<< %s: exec reply nil, possible due "
+			"optimistic locking >>\n", __func__);
+	freeReplyObject(reply);
 
 	destroy_cachedb();
 }
@@ -1534,6 +1554,16 @@ static void clear_cachedb(const struct query *q)
 
 	init_cachedb();
 
+	reply = redisCommand(cachedb_ctx, "WATCH %s:%s", KEY_PREFIX, q->qname);
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "MULTI");
+	if (!reply)
+		cachedb_error();
+	freeReplyObject(reply);
+
 	for (i = 0; i < 7; i++) {
 		for (j = 0; j < 5; j++) {
 			reply = redisCommand(cachedb_ctx, "DEL %s:%s:%s:%s",
@@ -1549,11 +1579,24 @@ static void clear_cachedb(const struct query *q)
 		if (!reply)
 			cachedb_error();
 		freeReplyObject(reply);
+
+		reply = redisCommand(cachedb_ctx, "DECR %s:%s", KEY_PREFIX, q->qname);
+		if (!reply)
+			cachedb_error();
+		freeReplyObject(reply);
 	}
 
 	reply = redisCommand(cachedb_ctx, "DEL %s:%s:time", KEY_PREFIX, q->qname);
 	if (!reply)
 		cachedb_error();
+	freeReplyObject(reply);
+
+	reply = redisCommand(cachedb_ctx, "EXEC");
+	if (!reply)
+		cachedb_error();
+	if (config.debug && reply->type == REDIS_REPLY_NIL)
+		fprintf(stderr, "<< %s: exec reply nil, possible due "
+			"optimistic locking >>\n", __func__);
 	freeReplyObject(reply);
 
 	reply = redisCommand(cachedb_ctx, "DEL %s:%s", KEY_PREFIX, q->qname);
