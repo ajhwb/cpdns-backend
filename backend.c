@@ -72,12 +72,13 @@ struct query {
 	char remote_ip[16];
 };
 
+/* FIXME: qname and data field should be in dynamic size */
 struct answer {
 	int qtype;
 	int mx_code;
 	unsigned int ttl;
 	char qname[256];
-	char data[256];
+	char data[512];
 };
 
 struct cache_data {
@@ -442,6 +443,15 @@ static int rr2answer(const ldns_rr *rr, struct answer *ans)
 		if (data_len + str_len < sizeof(result.data) - 1) {
 			memcpy(result.data + data_len, str, str_len);
 			data_len += str_len;
+		} else {
+			/* Each data field must start and end with '"' */
+			memcpy(result.data, str, sizeof(result.data) - 2);
+			result.data[sizeof(result.data) - 2] = '"';
+			data_len += sizeof(result.data) - 1;
+
+			if (config.debug)
+				fprintf(stderr, "<< %s: data field oversized the "
+					"buffer >>\n", __func__);
 		}
 
 		/* Append space separator for each rdf data */
