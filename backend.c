@@ -17,6 +17,7 @@
  */
 
 #include <sys/time.h>
+#include <pthread.h>
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
@@ -528,6 +529,173 @@ static int process_result(const ldns_pkt *pkt, queue_t **result)
 
 	return retval;
 }
+
+struct resolve_data {
+	const ldns_rdf *rdf;
+	queue_t **result;
+	pthread_mutex_t *mutex;
+	int type;
+};
+
+void *get_all_record_async_func(void *arg)
+{
+	ldns_pkt *pkt;
+	ldns_rr_list *list;
+	ldns_rr *rr;
+	queue_t *tmp, *ptr;
+	struct answer *ans;
+	struct resolve_data *data = arg;
+	int nrr, i;
+
+	pkt = ldns_resolver_query(resolver, data->rdf, data->type,
+				  LDNS_RR_CLASS_IN, LDNS_RD);
+	if (!pkt) {
+		fprintf(stderr, "<< %s: resolve fail >>\n", __func__);
+		return NULL;
+	}
+
+	if (ldns_pkt_get_rcode(pkt) != LDNS_RCODE_NOERROR) {
+		ldns_pkt_free(pkt);
+		return NULL;
+	}
+
+	list = ldns_pkt_rr_list_by_type(pkt, data->type, LDNS_SECTION_ANSWER);
+	ldns_pkt_free(pkt);
+	if (!list)
+		return NULL;
+
+	nrr = ldns_rr_list_rr_count(list);
+	if (nrr > 0)
+		ldns_rr_list_sort(list);
+
+	tmp = NULL;
+	for (i = 0; i < nrr; i++) {
+		rr = ldns_rr_list_rr(list, i);
+		ans = xmalloc(sizeof(struct answer));
+		if (!rr2answer(rr, ans)) {
+			free(ans);
+			continue;
+		}
+		tmp = queue_prepend(tmp, ans);
+	}
+
+	ldns_rr_list_deep_free(list);
+
+	if (tmp != NULL) {
+		pthread_mutex_lock(data->mutex);
+		if (*data->result == NULL)
+			*data->result = tmp;
+		else {
+			ptr = queue_last(*data->result);
+			ptr->next = tmp;
+		}
+		pthread_mutex_unlock(data->mutex);
+	}
+	return NULL;
+}
+
+/*
+ * Get all record contains in rr_type synchronously, 
+ * good speed but take many resources.
+ */
+int get_all_record_async(const ldns_rdf *rdf, queue_t **result, struct timespec *diff)
+{
+	size_t ntype = sizeof(rr_type) / sizeof(*rr_type);
+	struct resolve_data *data[ntype];
+	pthread_t thread[ntype];
+	pthread_mutex_t mutex;
+	queue_t *tmp_result = NULL;
+	struct timespec start, end;
+	int type, ret;
+
+	ret = pthread_mutex_init(&mutex, NULL);
+	if (ret != 0) {
+		fprintf(stderr, "<< %s: could not initialize mutex >>\n", __func__);
+		exit(EXIT_FAILURE);
+	}
+
+	clock_gettime(CLOCK_REALTIME, &start);
+
+	for (type = 0; type < ntype; type++) {
+		data[type] = xmalloc(sizeof(struct resolve_data));
+		data[type]->rdf = rdf;
+		data[type]->result = &tmp_result;
+		data[type]->mutex = &mutex;
+		data[type]->type = rr_type[type];
+
+		ret = pthread_create(&thread[type], NULL, 
+				     get_all_record_async_func, data[type]);
+		if (ret != 0) {
+			fprintf(stderr, "<< %s: could not create thread >>\n", __func__);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	for (type = 0; type < ntype; type++) {
+		pthread_join(thread[type], NULL);
+		free(data[type]);
+	}
+	clock_gettime(CLOCK_REALTIME, &end);
+	pthread_mutex_destroy(&mutex);
+
+	*diff = ts_diff(&start, &end);
+	if (queue_length(tmp_result) > 0)
+		*result = tmp_result;
+
+	return LDNS_RCODE_NOERROR;
+}
+
+/*
+ * Get all record contains in rr_type asynchronously, 
+ * use low resources but slow.
+ */
+int get_all_record_sync(const ldns_rdf *rdf, queue_t **result, struct timespec *diff)
+{
+	ldns_pkt *pkt;
+	queue_t *tmp_result = NULL, *ptr;
+	struct timespec start, end;
+	int nrecord = 0, type = 0, rcode, ret;
+
+	clock_gettime(CLOCK_REALTIME, &start);
+
+	while (type < sizeof(rr_type) / sizeof(*rr_type)) {
+		pkt = ldns_resolver_query(resolver, rdf, rr_type[type],
+					  LDNS_RR_CLASS_IN, LDNS_RD);
+		if (!pkt) {
+			fprintf(stderr, "<< %s: resolve fail\n", __func__);
+			return -1;
+		}
+
+		rcode = ldns_pkt_get_rcode(pkt);
+		if (rcode != LDNS_RCODE_NOERROR) {
+			free_cachedb_data(tmp_result);
+			return rcode;
+		}
+
+		queue_t *tmp = NULL;
+		ret = process_result(pkt, &tmp);
+		ldns_pkt_free(pkt);
+		type++;
+
+		if (ret > 0) {
+			nrecord += ret;
+			if (!tmp_result)
+				tmp_result = tmp;
+			else {
+				ptr = queue_last(tmp_result);
+				ptr->next = tmp;
+			}
+		}
+	}
+
+	clock_gettime(CLOCK_REALTIME, &end);
+	*diff = ts_diff(&start, &end);
+	if (nrecord > 0)
+		*result = tmp_result;
+
+	return rcode;
+}
+
 /*
  * do_query:
  * Returns: ldns_enum_plt_rcode enumerations.
@@ -660,11 +828,11 @@ int do_query(const struct query *q)
 
 	clock_gettime(CLOCK_MONOTONIC, &tm);
 
-	ldns_rdf_deep_free(rdf);
 	if (!pkt) {
 		if (config.debug)
 			fprintf(stderr, "<< resolve fail: %s >>\n", q->qname);
 		destroy_resolver();
+		ldns_rdf_deep_free(rdf);
 		rcode = LDNS_RCODE_SERVFAIL;
 		goto log;
 	}
@@ -678,6 +846,15 @@ int do_query(const struct query *q)
 			clear_cachedb(q);
 			sorted_data = queue_sort(data, sort_cachedb_func);
 			insert_cachedb(q, sorted_data, tm);
+		} else {
+			if (config.debug)
+				fprintf(stderr, "<< %s: has no ANY record >>\n", q->qname);
+			get_all_record_async(rdf, &data, &diff);
+			result = queue_length(data);
+			if (result > 0) {
+				sorted_data = queue_sort(data, sort_cachedb_func);
+				insert_cachedb(q, sorted_data, tm);
+			}
 		}
 
 		if (config.debug)
@@ -700,6 +877,8 @@ int do_query(const struct query *q)
 			free_cachedb_data(data);
 		}
 	}
+
+	ldns_rdf_deep_free(rdf);
 
 	if (rcode != LDNS_RCODE_NOERROR && config.debug)
 		fprintf(stderr, "<< %s: rcode: %i >>\n", q->qname, rcode);
