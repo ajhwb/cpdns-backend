@@ -1,7 +1,7 @@
 /*
  * Cool PowerDNS Backend
  *
- * Copyright (C) 2011 - Ardhan Madras <ajhwb@knac.com>
+ * Copyright (C) 2011 - 2012, Ardhan Madras <ajhwb@knac.com>
  *
  * This software is free software; you can redistribute it and/or modify it under 
  * the terms of the GNU General Public License as published by the Free Software 
@@ -147,6 +147,7 @@ static void close_database(void);
 static void insert_filter_cache(const struct query*, const struct filter_info*);
 static int lookup_filter_cache(const struct query*, struct filter_info*);
 static int is_www(const char*, tldnode*);
+static int str2answer(const char*, struct answer*);
 
 
 #define cachedb_error() \
@@ -214,6 +215,27 @@ static const char *rr2str(enum rr_type type)
 		return "TXT";
 	else
 		return "NULL";
+}
+
+static int str2rr(const char *str)
+{
+	if (!strcmp("ANY", str))
+		return RR_TYPE_ANY;
+	if (!strcmp("A", str))
+		return RR_TYPE_A;
+	if (!strcmp("AAAA", str))
+		return RR_TYPE_AAAA;
+	if (!strcmp("SOA", str))
+		return RR_TYPE_SOA;
+	if (!strcmp("MX", str))
+		return RR_TYPE_MX;
+	if (!strcmp("NS", str))
+		return RR_TYPE_NS;
+	if (!strcmp("CNAME", str))
+		return RR_TYPE_CNAME;
+	if (!strcmp("TXT", str))
+		return RR_TYPE_TXT;
+	return RR_TYPE_UNDEFINED;
 }
 
 struct answer *answer_new(int qtype, unsigned int ttl, const char *qname, const char *data)
@@ -1539,171 +1561,84 @@ static const char * const type_name[7] = {
 	"A", "AAAA", "SOA", "NS", "MX", "CNAME", "TXT"
 };
 
-/* 
- * Assigning different ttl expiration for each key is unsafe, on old 
- * Redis version, inserting data to list's key that has expiration 
- * will remove all previous data. Also happen with INCR key, value 
- * will be set to 1, so don't set expiration for list or INCR key 
- * here, but no problem for set.
- *
- * Key expiration value determined by finding the lowest ttl, then
- * double the value.
- *
- * As this program may be spawned by PowerDNS in many instances,
- * race condition evil may come on each transaction. Here we use 
- * optmistic locking routine, this features require at least 
- * version 2.2 of Redis.
- */
-static void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
+void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 {
 	redisReply *reply;
-	queue_t *ptr = data;
-	struct answer *a;
-	const char *type_str;
-	unsigned expiration = 0;
-	int i;
+	queue_t *ptr;
+	struct answer *ans;
+	static char string[BUFSIZ];
+	int value, count = 0;
+	int min_ttl = 0;
 
 	init_cachedb();
 
-	/* Find the lowest ttl */
+	reply = redisCommand(cachedb_ctx, "EXISTS %s:%s", KEY_PREFIX, q->qname);
+	if (!reply)
+		cachedb_error();
+	value = reply->integer;
+	freeReplyObject(reply);
+	if (value) {
+		destroy_cachedb();
+		return;
+	}
+
+	/* Determine minimal ttl for expiration */
+	ptr = data;
 	while (ptr) {
-		a = ptr->data;
+		ans = ptr->data;
 		if (ptr == data)
-			expiration = a->ttl;
-		expiration = expiration > a->ttl ? a->ttl : expiration;
+			min_ttl = ans->ttl;
+		else
+			min_ttl = min_ttl < ans->ttl ? min_ttl : ans->ttl;
 		ptr = ptr->next;
+		count++;
 	}
-
-	expiration <<= 1;
-
-	reply = redisCommand(cachedb_ctx, "WATCH %s:%s", KEY_PREFIX, q->qname);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-
-	reply = redisCommand(cachedb_ctx, "MULTI");
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
 
 	ptr = data;
 	while (ptr) {
+		ans = ptr->data;
+		snprintf(string, sizeof(string), "%s,%s,%i,%i,%s", 
+			 ans->qname, rr2str(ans->qtype), ans->ttl, 
+			 ans->qtype == RR_TYPE_MX ? ans->mx_code : 0, ans->data);
 
-		a = ptr->data;
-		type_str = rr2str(a->qtype);
-
-		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s:%s:qname %s", 
-				     KEY_PREFIX, q->qname, type_str, a->qname);
+		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s %b", 
+				     KEY_PREFIX, q->qname, string, strlen(string));
 		if (!reply)
 			cachedb_error();
 		freeReplyObject(reply);
 
-		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s:%s:type %i", 
-				     KEY_PREFIX, q->qname, type_str, a->qtype);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s:%s:ttl %u", 
-				     KEY_PREFIX, q->qname, type_str, a->ttl);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s:%s:mxcode %i", 
-				     KEY_PREFIX, q->qname, type_str, a->mx_code);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		/* Binary mode for data list */
-		reply = redisCommand(cachedb_ctx, "RPUSH %s:%s:%s:data %b", KEY_PREFIX, 
-				     q->qname, type_str, a->data, strlen(a->data));
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		reply = redisCommand(cachedb_ctx, "INCR %s:%s:%s", 
-				     KEY_PREFIX, q->qname, type_str);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		/* Increase qname counter, it is watched for locking */
-		reply = redisCommand(cachedb_ctx, "INCR %s:%s", KEY_PREFIX, q->qname);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		if (a->qtype == RR_TYPE_NS || a->qtype == RR_TYPE_MX) {
+		/* For NS and MX record */
+		if (ans->qtype == RR_TYPE_NS || ans->qtype == RR_TYPE_MX) {
 			reply = redisCommand(cachedb_ctx, "SET %s:NSMX:%s %s",
-					     KEY_PREFIX, a->data, q->qname);
+					     KEY_PREFIX, ans->data, q->qname);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
 
-			reply = redisCommand(cachedb_ctx, "EXPIRE %s:NSMX:%s %li", 
-					     KEY_PREFIX, a->data, expiration);
+			/* 
+			 * Hack 0 ttl to prevent resolving of a NS/MX name A record
+			 * because of early cache expiration (very low or 0 ttl).
+	 		 */
+			reply = redisCommand(cachedb_ctx, "EXPIRE %s:NSMX:%s %i",
+					     KEY_PREFIX, ans->data, 
+					     min_ttl <= 0 ? 1 : min_ttl);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
 		}
 
 		ptr = ptr->next;
-	}
 
-	/* Set cache's insert time */
-	reply = redisCommand(cachedb_ctx, "SET %s:%s:time %li", 
-			     KEY_PREFIX, q->qname, ts.tv_sec);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-
-	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:time %li", 
-			     KEY_PREFIX, q->qname, expiration);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-
-	/*
-	 * Set expiration on list specific keys, expiration must be set 
-	 * after all records's data has been pushed.
-	 */
-	ptr = data;
-	while (ptr) {
-		a = ptr->data;
-		for (i = 0; i < 5; i++) {
-			reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s:%s %li",
-					     KEY_PREFIX, q->qname, rr2str(a->qtype), 
-					     field_name[i], expiration);
+		/* Also hack list ttl to prevent re-resolving */
+		if (!ptr) {
+			reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %i", 
+					     KEY_PREFIX, q->qname, 
+					     min_ttl <= 0 ? 1 : min_ttl);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
 		}
-
-		reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s %li",
-				     KEY_PREFIX, q->qname, rr2str(a->qtype), expiration);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		ptr = ptr->next;
 	}
-
-	/* Set qname expiration */
-	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %li",
-			     KEY_PREFIX, q->qname, expiration);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-
-	reply = redisCommand(cachedb_ctx, "EXEC");
-	if (!reply)
-		cachedb_error();
-	if (config.debug && reply->type == REDIS_REPLY_NIL)
-		fprintf(stderr, "<< %s: exec reply nil, possible due "
-			"optimistic locking >>\n", __func__);
-	freeReplyObject(reply);
 
 	destroy_cachedb();
 }
@@ -1719,6 +1654,9 @@ void free_cachedb_data(queue_t *data)
 	}
 }
 
+/*
+ * Should only be called by routine that perform init_cachedb() first.
+ */
 static int lookup_a_record(const struct query *q)
 {
 	redisReply *reply;
@@ -1739,61 +1677,108 @@ static int lookup_a_record(const struct query *q)
 static void clear_cachedb(const struct query *q)
 {
 	redisReply *reply;
-	int i, j;
+	struct answer ans;
+	static char cmd_buffer[BUFSIZ];
+	int value, i;
 
 	init_cachedb();
 
-	reply = redisCommand(cachedb_ctx, "WATCH %s:%s", KEY_PREFIX, q->qname);
+	reply = redisCommand(cachedb_ctx, "EXISTS %s:%s", KEY_PREFIX, q->qname);
 	if (!reply)
 		cachedb_error();
+	value = reply->integer;
 	freeReplyObject(reply);
+	if (!value) {
+		destroy_cachedb();
+		return;
+	}
 
-	reply = redisCommand(cachedb_ctx, "MULTI");
+	/* Look for any NS/MX record to delete NSMX key */
+	reply = redisCommand(cachedb_ctx, "LRANGE %s:%s 0 -1", KEY_PREFIX, q->qname);
 	if (!reply)
 		cachedb_error();
-	freeReplyObject(reply);
 
-	for (i = 0; i < 7; i++) {
-		for (j = 0; j < 5; j++) {
-			reply = redisCommand(cachedb_ctx, "DEL %s:%s:%s:%s",
-					     KEY_PREFIX, q->qname, type_name[i],
-					     field_name[j]);
+	for (i = 0; i < reply->elements; i++) {
+		if (!str2answer(reply->element[i]->str, &ans))
+			break;
+		if (ans.qtype == RR_TYPE_NS || ans.qtype == RR_TYPE_MX) {
+			snprintf(cmd_buffer, sizeof(cmd_buffer), "%s:NSMX:%s", 
+				 KEY_PREFIX, ans.data);
+
+			reply = redisCommand(cachedb_ctx, "DEL %s", cmd_buffer);
 			if (!reply)
 				cachedb_error();
 			freeReplyObject(reply);
 		}
-
-		reply = redisCommand(cachedb_ctx, "DEL %s:%s:%s",
-				     KEY_PREFIX, q->qname, type_name[i]);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-
-		reply = redisCommand(cachedb_ctx, "DECR %s:%s", KEY_PREFIX, q->qname);
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
 	}
 
-	reply = redisCommand(cachedb_ctx, "DEL %s:%s:time", KEY_PREFIX, q->qname);
-	if (!reply)
-		cachedb_error();
 	freeReplyObject(reply);
-
-	reply = redisCommand(cachedb_ctx, "EXEC");
-	if (!reply)
-		cachedb_error();
-	if (config.debug && reply->type == REDIS_REPLY_NIL)
-		fprintf(stderr, "<< %s: exec reply nil, possible due "
-			"optimistic locking >>\n", __func__);
-	freeReplyObject(reply);
-
 	reply = redisCommand(cachedb_ctx, "DEL %s:%s", KEY_PREFIX, q->qname);
 	if (!reply)
 		cachedb_error();
 	freeReplyObject(reply);
 
 	destroy_cachedb();
+}
+
+/*
+ * Helper function to extract each sub-string in cache string to 
+ * struct answer form.
+ */
+static int str2answer(const char *string, struct answer *ans)
+{
+	struct answer out;
+	const char *tmp;
+	char *ptr, *tmp2;
+	int count = 0, retval = 0;
+	size_t len;
+
+	tmp = string;
+	while ((ptr = strchr(tmp, ','))) {
+		tmp2 = xstrndup(tmp, ptr - tmp);
+
+		/* qname */
+		if (count == 0) {
+			len = ptr - tmp;
+			if (len >= sizeof(out.qname)) {
+				free(tmp2);
+				break;
+			}
+			memcpy(out.qname, tmp2, len);
+			out.qname[len] = '\0';
+		/* qtype */
+		} else if (count == 1) {
+			out.qtype = str2rr(tmp2);
+		/* ttl */
+		} else if (count == 2) {
+			out.ttl = strtol(tmp2, NULL, 10);
+		/* mx code */
+		} else if (count == 3) {
+			out.mx_code = strtol(tmp2, NULL, 10);
+		}
+
+		free(tmp2);
+
+		if (count == 3)
+			break;
+		tmp = ++ptr;
+		count++;
+	}
+
+	/* data */
+	if (count == 3 && ptr != NULL) {
+		tmp = ++ptr;
+		len = strlen(tmp);
+		if (len < sizeof(out.data)) {
+			memcpy(out.data, tmp, len);
+			out.data[len] = '\0';
+			retval = 1;
+		}
+	}
+
+	if (retval == 1)
+		*ans = out;
+	return retval;
 }
 
 /*
@@ -1807,193 +1792,124 @@ static void clear_cachedb(const struct query *q)
  */
 int lookup_cachedb(const struct query *q, queue_t **res)
 {
-	queue_t *data;
-	queue_t *ptr;
-	int nrecords, n, i;
-	unsigned ttl, tmp;
-	long tm;
-	struct answer *ans;
-	struct timespec ts;
-	redisReply *reply[5];
+	queue_t *out_res = NULL;
+	queue_t *fil_res = NULL;
+	queue_t *ptr_res;
+	struct answer *ans, *tmp_ans;
+	redisReply *reply;
+	int value, i, retval = 0;
+	int min_ttl = 0, cur_ttl, tmp_ttl;
 
 	init_cachedb();
 
-	/* Determine how many name's records was cached */
-
-	*reply = redisCommand(cachedb_ctx, "GET %s:%s", KEY_PREFIX, q->qname);
-	if (*reply == NULL)
+	reply = redisCommand(cachedb_ctx, "EXISTS %s:%s", KEY_PREFIX, q->qname);
+	if (!reply)
 		cachedb_error();
+	value = reply->integer;
+	freeReplyObject(reply);
 
-	if ((*reply)->type == REDIS_REPLY_NIL)
-		nrecords = 0;
-	else
-		nrecords = atoi((*reply)->str);
-
-	freeReplyObject(*reply);
-
-	/* n < 0, possible MX/NS record for query */
-
-
-	*reply = redisCommand(cachedb_ctx, "GET %s:%s:%s", 
-			      KEY_PREFIX, q->qname, rr2str(q->qtype_id));
-
-	if (*reply == NULL)
-		cachedb_error();
-
-	if ((*reply)->type == REDIS_REPLY_NIL)
-		n = 0;
-	else
-		n = atoi((*reply)->str);
-
-	freeReplyObject(*reply);
-
-	if (config.debug && (nrecords > 0 || n > 0)) {
-		if (q->qtype_id == RR_TYPE_ANY)
-			fprintf(stderr, "<< %s: cache hits: %i records >>\n",
-				q->qname, nrecords);
-		else
-			fprintf(stderr, "<< %s: cache hits: %i/%i records >>\n",
-				q->qname, nrecords, n);
-	}
-
-	if (n <= 0) {
-		/* Search for possible MX/NS record A or AAAA query */
+	/*
+	 * If record was not found, search for possible NS/MX record's A query.
+	 * PowerDNS always query for A record for NS/MX data
+	 */
+	if (!value) {
 		if (q->qtype_id == RR_TYPE_A) {
-			n = lookup_a_record(q);
-			if (n) {
-				destroy_cachedb();
-				return -2;
-			}
-			if (nrecords == 0 && n == 0) {
-				destroy_cachedb();
-				return 0;
-			}
-			if (nrecords > 0 && n == 0) {
-				destroy_cachedb();
-				return -1;
-			}
-		} else if (q->qtype_id == RR_TYPE_ANY) {
-			if (nrecords == 0) {
-				destroy_cachedb();
-				return 0;
-			}
-		} else {
-			if (nrecords == 0 && n == 0) {
-				destroy_cachedb();
-				return 0;
-			}
-			if (nrecords > 0 && n == 0) {
-				destroy_cachedb();
-				return -1;
-			}
+			value = lookup_a_record(q);
+			if (value)
+				retval = -2;
 		}
+		goto end;
 	}
 
-	nrecords = n;
-	ttl = 86400;
-	data = NULL;
+	/* Check if this record has been expired */
+	reply = redisCommand(cachedb_ctx, "TTL %s:%s", KEY_PREFIX, q->qname);
+	if (!reply)
+		cachedb_error();
+	cur_ttl = reply->integer;
+	freeReplyObject(reply);
+	if (cur_ttl < 0)
+		goto end;
 
-	/* Iterate over records ttl's field to determine lowest ttl value */
-	for (i = 0; i < 7; i++) {
-		*reply = redisCommand(cachedb_ctx, "LRANGE %s:%s:%s:%s 0 -1",
-				      KEY_PREFIX, q->qname, type_name[i], 
-				      field_name[2]);
-		if (*reply == NULL)
-			cachedb_error();
-
-		for (n = 0; n < reply[0]->elements; n++) {
-			tmp = atol(reply[0]->element[n]->str);
-			ttl = ttl > tmp ? tmp : ttl;
-		}
-
-		freeReplyObject(*reply);
-	}
-
-	/* Insert queue's data with cache records */
-	if (q->qtype_id == RR_TYPE_ANY) {
-
-		for (i = 0; i < 7; i++) {
-			for (n = 0; n < 5; n++) {
-				reply[n] = redisCommand(cachedb_ctx, "LRANGE "
-							"%s:%s:%s:%s 0 -1",
-							KEY_PREFIX, q->qname,
-							type_name[i], field_name[n]);
-				if (!reply[n])
-					cachedb_error();
-			}
-
-			/* Iterate and insert each record type to list */
-			for (n = 0; n < reply[0]->elements; n++) {
-				ans = xmalloc(sizeof(struct answer));
-				strcpy(ans->qname, reply[0]->element[n]->str);
-				ans->qtype = atoi(reply[1]->element[n]->str);
-				ans->ttl = atol(reply[2]->element[n]->str);
-				ans->mx_code = atoi(reply[3]->element[n]->str);
-				strcpy(ans->data, reply[4]->element[n]->str);
-				data = queue_prepend(data, ans);
-			}
-
-			for (n = 0; n < 5; n++)
-				freeReplyObject(reply[n]);
-		}
-
-	} else {
-		for (n = 0; n < 5; n++) {
-			reply[n] = redisCommand(cachedb_ctx, "LRANGE %s:%s:%s:%s 0 -1",
-						KEY_PREFIX, q->qname,
-						rr2str(q->qtype_id), field_name[n]);
-			if (!reply[n])
-				cachedb_error();
-		}
-
-		for (n = 0; n < reply[0]->elements; n++) {
-			ans = xmalloc(sizeof(struct answer));
-			strcpy(ans->qname, reply[0]->element[n]->str);
-			ans->qtype = atoi(reply[1]->element[n]->str);
-			ans->ttl = atol(reply[2]->element[n]->str);
-			ans->mx_code = atoi(reply[3]->element[n]->str);
-			strcpy(ans->data, reply[4]->element[n]->str);
-			data = queue_prepend(data, ans);
-		}
-
-		for (n = 0; n < 5; n++)
-			freeReplyObject(reply[n]);
-	}
-
-	*reply = redisCommand(cachedb_ctx, "GET %s:%s:time", KEY_PREFIX, q->qname);
-	if (*reply == NULL)
+	reply = redisCommand(cachedb_ctx, "LRANGE %s:%s 0 -1", KEY_PREFIX, q->qname);
+	if (!reply)
 		cachedb_error();
 
-	tm = atol((*reply)->str);
-
-	freeReplyObject(*reply);
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-
-	if (ts.tv_sec - tm <= ttl) {
-		ptr = data;
-		while (ptr) {
-			struct answer *a = ptr->data;
-			a->ttl -= ts.tv_sec - tm;
-			ptr = ptr->next;
+	for (i = 0; i < reply->elements; i++) {
+		ans = xmalloc(sizeof(struct answer));
+		value = str2answer(reply->element[i]->str, ans);
+		if (!value) {
+			fprintf(stderr, "<< %s: error parsing cache data >>\n",q->qname);
+			exit (EXIT_FAILURE);
 		}
-		if (config.debug)
-			fprintf(stderr, "<< %s: expire in %li s >>\n", 
-				q->qname, ttl - (ts.tv_sec - tm));
-	} else {
-		if (config.debug)
-			fprintf(stderr, "<< %s: cache was expired, min ttl: "
-				"%i s >>\n", q->qname, ttl);
-		free_cachedb_data(data);
-		destroy_cachedb();
-		return 0;
+		out_res = queue_prepend(out_res, ans);
+		if (i == 0)
+			min_ttl = ans->ttl;
+		else
+			min_ttl = min_ttl < ans->ttl ? min_ttl : ans->ttl;
 	}
 
-	*res = data;
+	freeReplyObject(reply);
+	if (i == 0) {
+		fprintf(stderr, "<< %s: cache was expired while retrieving, "
+			"min_ttl: %is >>\n", q->qname, min_ttl);
+		goto end;
+	}
 
+	/* Set record's TTL, except for 0 TTL (hacked TTL on insert_cachedb) */
+	ptr_res = out_res;
+	while (ptr_res) {
+		tmp_ans = ptr_res->data;
+		if (min_ttl > 0) {
+			tmp_ttl = tmp_ans->ttl - (min_ttl - cur_ttl);
+			if (tmp_ttl < 0) {
+				if (config.debug)
+					fprintf(stderr, "<< %s: cache was expired, "
+						"min_ttl: %is >>\n", q->qname, min_ttl);
+				goto end;
+			}
+			tmp_ans->ttl = tmp_ttl;
+		}
+		ptr_res = ptr_res->next;
+	}
+
+	/* Filter records output based on query type */
+	if (q->qtype_id == RR_TYPE_ANY) {
+		*res = out_res;
+		retval = i;
+	} else {
+		retval = 0;
+		ptr_res = out_res;
+		while (ptr_res) {
+			tmp_ans = ptr_res->data;
+			if (tmp_ans->qtype == q->qtype_id) {
+				ans = xmalloc(sizeof(struct answer));
+				memcpy(ans, tmp_ans, sizeof(struct answer));
+				fil_res = queue_prepend(fil_res, ans);
+				retval++;
+			}
+			ptr_res = ptr_res->next;
+		}
+
+		free_cachedb_data(out_res);
+
+		if (retval)
+			*res = fil_res;
+		else
+			retval = -1;
+	}
+
+	if (config.debug && retval > 0) {
+		if (q->qtype_id == RR_TYPE_ANY)
+			fprintf(stderr, "<< %s: cache hits: %i records >>\n", 
+				q->qname, retval);
+		else
+			fprintf(stderr, "<< %s: cache hits: %i/%i records >>\n", 
+				q->qname, retval, i);
+	}
+
+end:
 	destroy_cachedb();
-
-	return 1;
+	return retval;
 }
 
 int insert_log(const struct log *log)
