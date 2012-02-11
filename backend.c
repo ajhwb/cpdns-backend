@@ -1865,6 +1865,7 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 				if (config.debug)
 					fprintf(stderr, "<< %s: cache was expired, "
 						"min_ttl: %is >>\n", q->qname, min_ttl);
+				free_cachedb_data(out_res);
 				goto end;
 			}
 			tmp_ans->ttl = tmp_ttl;
