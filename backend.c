@@ -146,7 +146,6 @@ static void insert_cachedb(const struct query*, queue_t*, struct timespec);
 static void close_database(void);
 static void insert_filter_cache(const struct query*, const struct filter_info*);
 static int lookup_filter_cache(const struct query*, struct filter_info*);
-static int is_www(const char*, tldnode*);
 static int str2answer(const char*, struct answer*);
 
 
@@ -733,11 +732,6 @@ int do_query(const struct query *q)
 	ldns_rdf *rdf;
 	ldns_pkt *pkt;
 
-
-	if (config.debug)
-		fprintf(stderr, "<< filtered name: %s >>\n", 
-			is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname);
-
 	memset(&fdiff, 0, sizeof(struct timespec));
 	if (config.filter) {
 		result = 0;
@@ -1099,37 +1093,6 @@ err:
 	return 0;
 }
 
-/*
- * Determine if domain prefixed by a WWW, it doesn't care if it 
- * stands for prefix or a subdomain.
- */
-static int is_www(const char *domain, tldnode *tld)
-{
-	char *name;
-	register int i;
-
-	if (strlen(domain) < 4)
-		return 0;
-	for (i = 0; i < 3; i++)
-		if (domain[i] != 'w' && domain[i] != 'W')
-			return 0;
-	if (domain[i] != '.')
-		return 0;
-
-	name = getRegisteredDomain((char*) domain, tld);
-	if (name == NULL)
-		return -1;
-
-	if (strlen(name) < 4)
-		return 0;
-	for (i = 0; i < 3; i++)
-		if (name[i] != 'w' && name[i] != 'W')
-			return 1;
-	if (name[i] != '.')
-		return 1;
-	return 0;
-}
-
 static inline int connect_database(unsigned int timeout)
 {
 	int ret;
@@ -1166,8 +1129,8 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	MYSQL_ROW row;
 	static char cmd[256];
 	int ret, num_rows, num_fields;
-	int is_www_retval;
 	unsigned long is_block_retval;
+	char *regdom;
 	struct answer *ans;
 	struct timespec start, end;
 	queue_t *data = NULL;
@@ -1185,7 +1148,7 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 			return 0;
 	}
 
-	is_www_retval = is_www(q->qname, tld_node);
+	regdom = getRegisteredDomain((char*) q->qname, tld_node);
 
 	clock_gettime(CLOCK_REALTIME, &start);
 
@@ -1193,13 +1156,14 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 		exit(EXIT_FAILURE);
 
 	sprintf(cmd, "select check_filter_status('%s', '%s')", 
-		is_www_retval == 1 ? pass_www(q->qname) : q->qname,
-		q->remote_ip);
+		regdom ? regdom : q->qname, q->remote_ip);
 
 	ret = mysql_query(my_conn, cmd);
 
 	clock_gettime(CLOCK_REALTIME, &end);
 	*diff = ts_diff(&start, &end);
+	if (regdom)
+		free(regdom);
 
 	if (ret) {
 		fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
@@ -1288,6 +1252,7 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	MYSQL_RES *res;
 	MYSQL_ROW row;
 	static char cmd[256];
+	char *regdom;
 	int ret, num_rows, num_fields;
 	unsigned long is_block_retval, client_id;
 	struct answer *ans;
@@ -1312,8 +1277,11 @@ static int search_blacklist(const struct query *q, queue_t **blacklist,
 	if (connect_database(3) == 0)
 		exit(EXIT_FAILURE);
 
-	sprintf(cmd, "call is_block('%q', '%q')", q->remote_ip, 
-		is_www(q->qname, tld_node) == 1 ? pass_www(q->qname) : q->qname);
+	regdom = getRegisteredDomain((char*) q->qname, tld_node);
+	sprintf(cmd, "call is_block('%q', '%q')", q->remote_ip,
+		regname ? regname : q->qname);
+	if (regdom)
+		free(regdom);
 
 	if (config.debug)
 		fprintf(stderr, "<< %s >>\n", cmd);
