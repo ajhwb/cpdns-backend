@@ -1614,11 +1614,13 @@ void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 void free_cachedb_data(queue_t *data)
 {
 	queue_t *ptr = data;
+	queue_t *tmp;
 
 	while (ptr) {
+		tmp = ptr->next;
 		free(ptr->data);
 		free(ptr);
-		ptr = ptr->next;
+		ptr = tmp;
 	}
 }
 
