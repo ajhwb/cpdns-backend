@@ -147,6 +147,8 @@ static void close_database(void);
 static void insert_filter_cache(const struct query*, const struct filter_info*);
 static int lookup_filter_cache(const struct query*, struct filter_info*);
 static int str2answer(const char*, struct answer*);
+static void init_cachedb(void);
+static void destroy_cachedb(void);
 
 
 #define cachedb_error() \
@@ -861,7 +863,9 @@ int do_query(const struct query *q)
 		if (result > 0) {
 			clear_cachedb(q);
 			sorted_data = queue_sort(data, sort_cachedb_func);
+			init_cachedb();
 			insert_cachedb(q, sorted_data, tm);
+			destroy_cachedb();
 		} else {
 			if (config.debug)
 				fprintf(stderr, "<< %s: has no ANY record >>\n", q->qname);
@@ -869,7 +873,9 @@ int do_query(const struct query *q)
 			result = queue_length(data);
 			if (result > 0) {
 				sorted_data = queue_sort(data, sort_cachedb_func);
+				init_cachedb();
 				insert_cachedb(q, sorted_data, tm);
+				destroy_cachedb();
 			}
 		}
 
@@ -1371,7 +1377,7 @@ block:
 }
 #endif
 
-void init_cachedb(void)
+static void init_cachedb(void)
 {
 	cachedb_ctx = redisConnect(config.cache_host, config.cache_port);
 
@@ -1389,7 +1395,7 @@ void init_cachedb(void)
 #endif
 }
 
-void destroy_cachedb(void)
+static void destroy_cachedb(void)
 {
 	redisFree(cachedb_ctx);
 }
@@ -1532,23 +1538,23 @@ static const char * const type_name[7] = {
 void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 {
 	redisReply *reply;
-	queue_t *ptr;
-	struct answer *ans;
+	queue_t *ptr, *cname_ptr;
+	queue_t *cname_list = NULL;
+	queue_t *cname_result = NULL;
+	struct answer *ans, *cname_ans;
+	struct query cname_query;
 	static char string[BUFSIZ];
+	char *cname_data;
 	int value, count = 0;
 	int min_ttl = 0;
-
-	init_cachedb();
 
 	reply = redisCommand(cachedb_ctx, "EXISTS %s:%s", KEY_PREFIX, q->qname);
 	if (!reply)
 		cachedb_error();
 	value = reply->integer;
 	freeReplyObject(reply);
-	if (value) {
-		destroy_cachedb();
+	if (value)
 		return;
-	}
 
 	/* Determine minimal ttl for expiration */
 	ptr = data;
@@ -1574,6 +1580,12 @@ void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 		if (!reply)
 			cachedb_error();
 		freeReplyObject(reply);
+
+		/* Store CNAME data to collect the data's records */
+		if (ans->qtype == RR_TYPE_CNAME) {
+			cname_data = xstrndup(ans->data, -1);
+			cname_list = queue_prepend(cname_list, cname_data);
+		}
 
 		/* For NS and MX record */
 		if (ans->qtype == RR_TYPE_NS || ans->qtype == RR_TYPE_MX) {
@@ -1608,7 +1620,38 @@ void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 		}
 	}
 
-	destroy_cachedb();
+	/* Collect each CNAME data's records */
+	cname_ptr = cname_list;
+	while (cname_ptr) {
+		ptr = data;
+		while (ptr) {
+			ans = ptr->data;
+			if (!strcmp(ans->qname, (char*) cname_list->data)) {
+				cname_ans = xmalloc(sizeof(struct answer));
+				memcpy(cname_ans, ans, sizeof(struct answer));
+				cname_result = queue_prepend(cname_result, cname_ans);
+			}
+			ptr = ptr->next;
+		}
+		cname_ptr = cname_ptr->next;
+	}
+
+	if (cname_list)
+		free_cachedb_data(cname_list);
+
+	/* Recurse insertion of CNAME data's records */
+	cname_ptr = cname_result;
+	while (cname_ptr) {
+		memcpy(&cname_query, q, sizeof(struct query));
+		ans = cname_ptr->data;
+		sprintf(cname_query.qname, "%s", ans->qname);
+
+		insert_cachedb(&cname_query, cname_result, ts);
+		cname_ptr = cname_ptr->next;
+	}
+
+	if (cname_result)
+		free_cachedb_data(cname_result);
 }
 
 void free_cachedb_data(queue_t *data)
