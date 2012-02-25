@@ -159,19 +159,6 @@ do { \
 } while (0);
 
 
-#define cachedb_cmd(cmd, use_reply) \
-({ \
-	redisReply *reply = redisCommand(cachedb_ctx, cmd); \
-	if (!reply) { \
-		fprintf(stderr, "<< %s: %s >>\n", __func__, \
-			cachedb_ctx->errstr); \
-		exit(EXIT_FAILURE); \
-	} \
-	if ((use_reply) == 0) \
-		freeReplyObject(reply); \
-	reply; \
-})
-
 #define xmalloc(n) \
 ({ \
 	void *ptr = malloc(n); \
@@ -181,8 +168,6 @@ do { \
 	} \
 	ptr; \
 })
-
-#define pass_www(name)	((name) + 4)
 
 char *xstrndup(const char *src, int len)
 {
@@ -237,23 +222,6 @@ static int str2rr(const char *str)
 	if (!strcmp("TXT", str))
 		return RR_TYPE_TXT;
 	return RR_TYPE_UNDEFINED;
-}
-
-struct answer *answer_new(int qtype, unsigned int ttl, const char *qname, const char *data)
-{
-	struct answer *ans = malloc(sizeof(struct answer));
-	if (ans != NULL) {
-		ans->qtype = qtype;
-		ans->ttl = ttl;
-		sprintf(ans->qname, "%s", qname);
-		sprintf(ans->data, "%s", data);
-	}
-	return ans;
-}
-
-void answer_free(struct answer *ans)
-{
-	free(ans);
 }
 
 static int init_resolver(void)
@@ -1127,7 +1095,6 @@ static void close_database(void)
 	mysql_close(my_conn);
 }
 
-#ifdef _KDNS
 static int search_blacklist(const struct query *q, queue_t **blacklist, 
 		struct filter_info *fi, struct timespec *diff)
 {
@@ -1249,133 +1216,6 @@ block:
 
 	return 1;
 }
-#endif
-
-#ifndef _KDNS
-static int search_blacklist(const struct query *q, queue_t **blacklist, 
-		struct filter_info *fi, struct timespec *diff)
-{
-	MYSQL_RES *res;
-	MYSQL_ROW row;
-	static char cmd[256];
-	char *regdom;
-	int ret, num_rows, num_fields;
-	unsigned long is_block_retval, client_id;
-	struct answer *ans;
-	struct timespec start, end;
-	queue_t *data = NULL;
-
-	clock_gettime(CLOCK_REALTIME, &start);
-/*
-	ret = lookup_filter_cache(q, fi);
-	if (ret) {
-		if (config.debug)
-			fprintf(stderr, "<< %s: filter cache hits >>\n", __func__);
-		clock_gettime(CLOCK_REALTIME, &end);
-		*diff = ts_diff(&start, &end);
-		if (fi->status)
-			goto block;
-		else
-			return 0;
-	}
-*/
-
-	if (connect_database(3) == 0)
-		exit(EXIT_FAILURE);
-
-	regdom = getRegisteredDomain((char*) q->qname, tld_node);
-	sprintf(cmd, "call is_block('%q', '%q')", q->remote_ip,
-		regname ? regname : q->qname);
-	if (regdom)
-		free(regdom);
-
-	if (config.debug)
-		fprintf(stderr, "<< %s >>\n", cmd);
-	ret = mysql_query(my_conn, cmd);
-
-	clock_gettime(CLOCK_REALTIME, &end);
-	*diff = ts_diff(&start, &end);
-
-	if (ret) {
-		fprintf(stderr, "<< %s: sql query failed >>\n", __func__);
-		close_database();
-		return -1;
-	}
-
-	res = mysql_store_result(my_conn);
-	if (!res) {
-		close_database();
-		return 0;
-	}
-
-	num_rows = mysql_num_rows(res);
-	if (num_rows <= 0) {
-		close_database();
-		return 0;
-	}
-
-	num_fields = mysql_num_fields(res);
-	if (num_fields < 3) {
-		if (config.debug)
-			fprintf(stderr, "<< %s: only return %i fields, "
-				"expected 3 fields >>\n", __func__, num_fields);
-		mysql_free_result(res);
-		close_database();
-		return -1;
-	}
-
-	row = mysql_fetch_row(res);
-	is_block_retval = *row ? strtoul (*row, NULL, 10) : 0;
-	client_id = row[2] ? strtoul (row[2], NULL, 10) : 0;
-
-	if (config.debug)
-		fprintf(stderr, "<< %s: retval: %lu >>\n", __func__, is_block_retval);
-
-	mysql_free_result(res);
-	close_database();
-
-	/* No blocking */
-	fi->id = client_id;
-	if (is_block_retval == 0UL) {
-		fi->status = 0;
-		return 0;
-	} else
-		fi->status = 1;
-
-	/* insert_filter_cache(q, fi); */
-
-block:
-	/* Build A and SOA record, PowerDNS need at least SOA 
-	 * and A record to make query answered correctly.
-	 */
-
-	ans = xmalloc(sizeof(struct answer));
-
-	strcpy(ans->qname, q->qname);
-	strcpy(ans->data, config.landing_page);
-	ans->qtype = RR_TYPE_A;
-	ans->ttl = 0;
-
-	data = queue_prepend(data, ans);
-
-	ans = xmalloc(sizeof(struct answer));
-
-	strcpy(ans->qname, q->qname);
-	strcpy(ans->data, "ns1.amaladns.com dns.amala.net "
-	       "2011052500 28800 7200 604800 86400");
-	ans->qtype = RR_TYPE_SOA;
-	ans->ttl = 3600;
-
-	data = queue_prepend(data, ans);
-
-	if (config.debug)
-		fprintf(stderr, "<< %s: record found >>\n", q->qname);;
-
-	*blacklist = data;
-
-	return num_rows;
-}
-#endif
 
 static void init_cachedb(void)
 {
@@ -1387,59 +1227,12 @@ static void init_cachedb(void)
 			cachedb_ctx->errstr);
 		exit(EXIT_FAILURE);
 	}
-
-#if 0
-	if (config.debug)
-		fprintf(stderr, "<< %s: connected to %s:%i >>\n",
-			__func__, config.cache_host, config.cache_port);
-#endif
 }
 
 static void destroy_cachedb(void)
 {
 	redisFree(cachedb_ctx);
 }
-
-#if 0
-/*
- * Set expiration on list specific keys, expiration must be set 
- * after all records data has been pushed.
- */
-static void expire_cachedb_records(const struct query *q, const struct answer *a,
-				   unsigned int ttl)
-{
-	int i;
-	redisReply *reply;
-
-	for (i = 0; i < 5; i++) {
-		reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s:%s %li",
-				     KEY_PREFIX, q->qname, rr2str(a->qtype), 
-				     field_name[i], ttl);
-
-		if (!reply)
-			cachedb_error();
-		freeReplyObject(reply);
-	}
-
-	reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s:%s %li",
-			     KEY_PREFIX, q->qname, rr2str(a->qtype), ttl);
-	if (!reply)
-		cachedb_error();
-	freeReplyObject(reply);
-}
-
-/* Set qname counter key expiration */
-static void expire_cachedb_count(const struct query *q, unsigned int ttl)
-{
-	redisReply *reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %li",
-					 KEY_PREFIX, q->qname, ttl);
-
-	if (!reply)
-		cachedb_error();
-
-	freeReplyObject(reply);
-}
-#endif
 
 /**
  * Insert database query result into cache that will be used for next 
