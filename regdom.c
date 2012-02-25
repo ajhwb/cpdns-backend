@@ -230,6 +230,11 @@ char* getRegisteredDomain(char* signingDomain, tldnode* tree) {
 		token = strtok_r(NULL, ".", &saveptr);
 	}
 
+	if (head==NULL) {
+		freeDomLabels(head, sDcopy);
+		return NULL;
+	}
+
 	char* result = findRegisteredDomain(tree, head);
 
 	if (result==NULL) {
