@@ -102,6 +102,7 @@ struct config {
 	int log;
 	int log_file;
 	int debug;
+	int use_recursor;
 };
 
 struct log {
@@ -790,6 +791,14 @@ int do_query(const struct query *q)
 	} else if (result < 0)
 		return LDNS_RCODE_NOERROR;
 
+	if (config.use_recursor) {
+		rcode = LDNS_RCODE_NOERROR;
+		clock_gettime(CLOCK_REALTIME, &start);
+		diff = (struct timespec) { .tv_sec = 0, .tv_nsec = 0 };
+		fdiff = diff;
+		goto log;
+	}
+
 	init_resolver();
 
 	rdf = ldns_dname_new_frm_str(q->qname);
@@ -1043,6 +1052,7 @@ int read_config(void)
 	config.log = g_key_file_get_boolean(key, "config", "log", NULL);
 	config.debug = g_key_file_get_boolean(key, "config", "debug", NULL);
 	config.log_file = g_key_file_get_boolean(key, "config", "log-file", NULL);
+	config.use_recursor = g_key_file_get_boolean(key, "config", "use-recursor", NULL);
 	g_key_file_free(key);
 
 	config.host = host;
