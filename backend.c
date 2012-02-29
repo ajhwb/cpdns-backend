@@ -96,6 +96,7 @@ struct config {
 	char *log_database;
 	char *landing_page;
 	char *log_dir;
+	char *redirect_address;
 	unsigned short port;
 	unsigned short cache_port;
 	int filter;
@@ -103,6 +104,7 @@ struct config {
 	int log_file;
 	int debug;
 	int use_recursor;
+	int redirect_error;
 };
 
 struct log {
@@ -1019,11 +1021,11 @@ int read_config(void)
 {
 	GKeyFile *key = g_key_file_new ();
 	char *host, *database, *username, *password, *cache_host, 
-		*log_database, *log_dir, *landing_page;
+		*log_database, *log_dir, *landing_page, *redirect_address;
 	int ret;
 
 	host = database = username = password = cache_host = log_database = NULL;
-	log_dir = NULL;
+	log_dir = redirect_address = NULL;
 
 	ret = g_key_file_load_from_file(key, CONFIG_FILE, G_KEY_FILE_NONE, NULL);
 	if (ret == 0) goto err;
@@ -1045,6 +1047,8 @@ int read_config(void)
 	log_dir = g_key_file_get_string(key, "config", "log-dir", NULL);
 	if (log_dir == NULL)
 		log_dir = g_strdup(LOG_DIR);
+	redirect_address = g_key_file_get_string(key, "config", "redirect-address", NULL);
+	if (redirect_address == NULL) goto err;
 
 	config.port = g_key_file_get_integer(key, "config", "port", NULL);
 	config.cache_port = g_key_file_get_integer(key, "config", "cache-port", NULL);
@@ -1053,6 +1057,7 @@ int read_config(void)
 	config.debug = g_key_file_get_boolean(key, "config", "debug", NULL);
 	config.log_file = g_key_file_get_boolean(key, "config", "log-file", NULL);
 	config.use_recursor = g_key_file_get_boolean(key, "config", "use-recursor", NULL);
+	config.redirect_error = g_key_file_get_boolean(key, "config", "redirect-error", NULL);
 	g_key_file_free(key);
 
 	config.host = host;
@@ -1063,6 +1068,7 @@ int read_config(void)
 	config.log_database = log_database;
 	config.landing_page = landing_page;
 	config.log_dir = log_dir;
+	config.redirect_address = redirect_address;
 
 	return 1;
 
@@ -1073,6 +1079,8 @@ err:
 	if (username != NULL) g_free(username);
 	if (cache_host != NULL) g_free(cache_host);
 	if (log_database != NULL) g_free(log_database);
+	if (log_dir != NULL) g_free(log_dir);
+	if (redirect_address != NULL) g_free(redirect_address);
 
 	return 0;
 }
