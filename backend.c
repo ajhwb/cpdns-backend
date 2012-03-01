@@ -152,6 +152,7 @@ static int lookup_filter_cache(const struct query*, struct filter_info*);
 static int str2answer(const char*, struct answer*);
 static void init_cachedb(void);
 static void destroy_cachedb(void);
+static int insert_record(const char*, const char*, queue_t**);
 
 
 #define cachedb_error() \
@@ -702,10 +703,14 @@ int do_query(const struct query *q)
 	struct log log;
 	struct filter_info fi;
 	int result, rcode;
-	ldns_rdf *rdf;
-	ldns_pkt *pkt;
+	int qtime = 0;
+	int ftime = 0;
+	int blacklist = 0;
+	long reqtime = time(NULL);
+	ldns_rdf *rdf = NULL;
+	ldns_pkt *pkt = NULL;
 
-	memset(&fdiff, 0, sizeof(struct timespec));
+	fdiff = (struct timespec) { .tv_sec = 0, .tv_nsec = 0 };
 	if (config.filter) {
 		result = 0;
 
@@ -740,25 +745,19 @@ int do_query(const struct query *q)
 			 */
 			if ((config.log || config.log_file) 
 			    && q->qtype_id == RR_TYPE_SOA) {
-				log.qtime = 0;
-				log.ftime = ts2ms(&fdiff);
-				log.blacklist = 1;
-				log.exist = 0;
-				log.status = 0;
-				log.qtype = q->qtype_id;
-				log.reqtime = time(NULL);
-				sprintf(log.qname, "%s", q->qname);
-				sprintf(log.remote, "%s", q->remote_ip);
-				if (config.log)
-					insert_log(&log);
-				if (config.log_file)
-					write_log(&log);
+				ftime = ts2ms(&fdiff);
+				blacklist = 1;
 			}
-
-			free_cachedb_data(data);
-
-			return LDNS_RCODE_NOERROR;
+			rcode = LDNS_RCODE_NOERROR;
+			goto log;
 		}
+	}
+
+	ftime = ts2ms(&fdiff);
+
+	if (config.use_recursor && !config.redirect_error) {
+		rcode = LDNS_RCODE_NOERROR;
+		goto log;
 	}
 
 	result = lookup_cachedb(q, &data);
@@ -774,32 +773,19 @@ int do_query(const struct query *q)
 
 		free_cachedb_data(data);
 		if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
-			log.qtime = 0;
-			log.ftime = ts2ms(&fdiff);
-			log.blacklist = 0;
-			log.exist = 1;
-			log.status = 0;
-			log.qtype = q->qtype_id;
-			log.reqtime = time(NULL);
-			sprintf(log.qname, "%s", q->qname);
-			sprintf(log.remote, "%s", q->remote_ip);
-			if (config.log)
-				insert_log(&log);
-			if (config.log_file)
-				write_log(&log);
+			rcode = LDNS_RCODE_NOERROR;
+			goto log;
 		}
 
 		return LDNS_RCODE_NOERROR;
-	} else if (result < 0)
+	} else if (result == -1) {
+		if (config.redirect_error) {
+			rcode = LDNS_RCODE_NOERROR;
+			goto log;
+		}
 		return LDNS_RCODE_NOERROR;
-
-	if (config.use_recursor) {
-		rcode = LDNS_RCODE_NOERROR;
-		clock_gettime(CLOCK_REALTIME, &start);
-		diff = (struct timespec) { .tv_sec = 0, .tv_nsec = 0 };
-		fdiff = diff;
-		goto log;
-	}
+	} else if (result == -2)
+		return LDNS_RCODE_NOERROR;
 
 	init_resolver();
 
@@ -807,37 +793,67 @@ int do_query(const struct query *q)
 	if (!rdf) {
 		if (config.debug)
 			fprintf(stderr, "<< invalid name: '%s' >>\n", q->qname);
-		return LDNS_RCODE_FORMERR;
+
+		rcode = LDNS_RCODE_FORMERR;
+
+		if (config.redirect_error) {
+			result = insert_record(q->qname, config.redirect_address, &data);
+			sorted_data = data;
+			goto process;
+		}
+		goto log;
 	}
 
 	if (config.debug || config.log || config.log_file)
 		clock_gettime(CLOCK_REALTIME, &start);
 
+	/*
+	 * It's always better to query for A record to probe name exisistence,
+	 * we should not rely on ANY or SOA query result because a name may
+	 * return NXDOMAIN or SERVFAIL for non A record query. 
+	 */
 	pkt = ldns_resolver_query(resolver, rdf,
-			          LDNS_RR_TYPE_ANY, 
+			          (config.redirect_error && config.use_recursor) ? 
+				  LDNS_RR_TYPE_A : LDNS_RR_TYPE_ANY, 
 				  LDNS_RR_CLASS_IN, 
 				  LDNS_RD);
 
 	if (config.debug || config.log || config.log_file) {
 		clock_gettime(CLOCK_REALTIME, &end);
 		diff = ts_diff(&start, &end);
+		qtime = ts2ms(&diff);
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &tm);
 
 	if (!pkt) {
+		rcode = LDNS_RCODE_SERVFAIL;
 		if (config.debug)
 			fprintf(stderr, "<< resolve fail: %s >>\n", q->qname);
-		destroy_resolver();
-		ldns_rdf_deep_free(rdf);
-		rcode = LDNS_RCODE_SERVFAIL;
-		goto log;
+		if (config.redirect_error) {
+			result = insert_record(q->qname, config.redirect_address, &data);
+			sorted_data = data;
+			goto process;
+		} else {
+			destroy_resolver();
+			ldns_rdf_deep_free(rdf);
+			goto log;
+		}
 	}
 
 	rcode = ldns_pkt_get_rcode(pkt);
-	if (rcode == LDNS_RCODE_NOERROR) {
 
-		result = process_result(pkt, &data);
+	if (config.redirect_error && rcode != LDNS_RCODE_NOERROR) {
+		result = insert_record(q->qname, config.redirect_address, &data);
+		sorted_data = data;
+		goto process;
+	}
+
+	if (rcode == LDNS_RCODE_NOERROR) {
+		if (config.redirect_error && config.use_recursor)
+			result++;
+		else
+			result = process_result(pkt, &data);
 
 		if (result > 0) {
 			clear_cachedb(q);
@@ -859,9 +875,9 @@ int do_query(const struct query *q)
 		}
 
 		if (config.debug)
-			fprintf(stderr, "<< %s: %i records, resolved in %li "
-				"ms >>\n", q->qname, result, ts2ms(&diff));
-
+			fprintf(stderr, "<< %s: %i records, resolved in %i ms >>\n", q->qname,
+				config.redirect_error ? 0 : result, qtime);
+process:
 		if (result > 0) {
 			ptr = sorted_data;
 			while (ptr) {
@@ -879,20 +895,21 @@ int do_query(const struct query *q)
 		}
 	}
 
-	ldns_rdf_deep_free(rdf);
-
 	if (rcode != LDNS_RCODE_NOERROR && config.debug)
 		fprintf(stderr, "<< %s: rcode: %i >>\n", q->qname, rcode);
 
-	ldns_pkt_free(pkt);
+	if (rdf)
+		ldns_rdf_deep_free(rdf);
+	if (pkt)
+		ldns_pkt_free(pkt);
 	destroy_resolver();
 
 log:
 	if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
-		log.reqtime = start.tv_sec;
-		log.qtime = ts2ms(&diff);
-		log.ftime = ts2ms(&fdiff);
-		log.blacklist = 0;
+		log.reqtime = reqtime;
+		log.qtime = qtime;
+		log.ftime = ftime;
+		log.blacklist = blacklist;
 		log.exist = rcode == LDNS_RCODE_NOERROR ? 1 : 0;
 		log.status = rcode;
 		log.qtype = q->qtype_id;
@@ -904,6 +921,8 @@ log:
 			write_log(&log);
 	}
 
+	if (config.redirect_error)
+		return LDNS_RCODE_NOERROR;
 	return rcode;
 }
 
@@ -1047,7 +1066,7 @@ int read_config(void)
 	log_dir = g_key_file_get_string(key, "config", "log-dir", NULL);
 	if (log_dir == NULL)
 		log_dir = g_strdup(LOG_DIR);
-	redirect_address = g_key_file_get_string(key, "config", "redirect-address", NULL);
+	redirect_address = g_key_file_get_string(key, "config", "redirect-error-address", NULL);
 	if (redirect_address == NULL) goto err;
 
 	config.port = g_key_file_get_integer(key, "config", "port", NULL);
@@ -1367,6 +1386,24 @@ void insert_cachedb(const struct query *q, queue_t *data, struct timespec ts)
 	if (value)
 		return;
 
+	/*
+	 * If error redirection and recursor are activated, key is only used 
+	 * to mark name's existence.
+	 */
+	if (config.redirect_address && config.use_recursor) {
+		reply = redisCommand(cachedb_ctx, "SET %s:%s 1", KEY_PREFIX, q->qname);
+		if (!reply)
+			cachedb_error();
+		freeReplyObject(reply);
+
+		reply = redisCommand(cachedb_ctx, "EXPIRE %s:%s %i",
+					KEY_PREFIX, q->qname, 3600);
+		if (!reply)
+			cachedb_error();
+		freeReplyObject(reply);
+		return;
+	}
+
 	/* Determine minimal ttl for expiration */
 	ptr = data;
 	while (ptr) {
@@ -1476,6 +1513,32 @@ void free_cachedb_data(queue_t *data)
 		free(ptr);
 		ptr = tmp;
 	}
+}
+
+static int insert_record(const char *qname, const char *address, queue_t **record_out)
+{
+	struct answer *ans;
+	queue_t *record = NULL;
+
+	ans = xmalloc(sizeof(struct answer));
+	strcpy(ans->qname, qname);
+	strcpy(ans->data, address);
+	ans->qtype = RR_TYPE_A;
+	ans->ttl = 0;
+
+	record = queue_prepend(record, ans);
+
+	ans = xmalloc(sizeof(struct answer));
+	strcpy(ans->qname, qname);
+	strcpy(ans->data, "ns1.kdns.com dns.kdns.com "
+	       "2011052500 28800 7200 604800 86400");
+	ans->qtype = RR_TYPE_SOA;
+	ans->ttl = 3600;
+
+	record = queue_prepend(record, ans);
+	*record_out = record;
+
+	return queue_length(record);
 }
 
 /*
@@ -1634,7 +1697,9 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 
 	/*
 	 * If record was not found, search for possible NS/MX record's A query.
-	 * PowerDNS always query for A record for NS/MX data
+	 * PowerDNS always query for A record for NS/MX data.
+	 * When error redirection and recursor is activated the key only used 
+	 * to mark whether the name is exists or not.
 	 */
 	if (!value) {
 		if (q->qtype_id == RR_TYPE_A) {
@@ -1643,6 +1708,13 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 				retval = -2;
 		}
 		goto end;
+	} else {
+		if (config.redirect_error && config.use_recursor) {
+			retval = -1;
+			if (config.debug)
+				fprintf(stderr, "<< %s: key exists >>\n", q->qname);
+			goto end;
+		}
 	}
 
 	/* Check if this record has been expired */
