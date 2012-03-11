@@ -25,7 +25,6 @@
 #include <mysql/mysql.h>
 #include <hiredis/hiredis.h>
 #include <ldns/ldns.h>
-#include <mysql/mysql.h>
 
 #include "queue.h"
 #include "keyval.h"
@@ -93,7 +92,6 @@ struct config {
 	char *password;
 	char *database;
 	char *cache_host;
-	char *log_database;
 	char *landing_page;
 	char *log_dir;
 	char *redirect_address;
@@ -101,7 +99,6 @@ struct config {
 	unsigned short cache_port;
 	int filter;
 	int log;
-	int log_file;
 	int debug;
 	int use_recursor;
 	int redirect_error;
@@ -142,7 +139,6 @@ static void clear_cachedb(const struct query*);
 void free_cachedb_data(queue_t*);
 static int search_blacklist(const struct query*, queue_t**, 
 				struct filter_info*, struct timespec*);
-static int insert_log(const struct log*);
 static int write_log(const struct log*);
 static int init_resolver(void);
 static void insert_cachedb(const struct query*, queue_t*, struct timespec);
@@ -743,8 +739,7 @@ int do_query(const struct query *q)
 			 * Depends on version of PowerDNS, it may query for SOA
 			 * record first then ANY record, and vice-versa.
 			 */
-			if ((config.log || config.log_file) 
-			    && q->qtype_id == RR_TYPE_SOA) {
+			if (config.log && q->qtype_id == RR_TYPE_SOA) {
 				ftime = ts2ms(&fdiff);
 				blacklist = 1;
 			}
@@ -772,7 +767,7 @@ int do_query(const struct query *q)
 		}
 
 		free_cachedb_data(data);
-		if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
+		if (config.log && q->qtype_id == RR_TYPE_SOA) {
 			rcode = LDNS_RCODE_NOERROR;
 			goto log;
 		}
@@ -804,7 +799,7 @@ int do_query(const struct query *q)
 		goto log;
 	}
 
-	if (config.debug || config.log || config.log_file)
+	if (config.debug || config.log)
 		clock_gettime(CLOCK_REALTIME, &start);
 
 	/*
@@ -818,7 +813,7 @@ int do_query(const struct query *q)
 				  LDNS_RR_CLASS_IN, 
 				  LDNS_RD);
 
-	if (config.debug || config.log || config.log_file) {
+	if (config.debug || config.log) {
 		clock_gettime(CLOCK_REALTIME, &end);
 		diff = ts_diff(&start, &end);
 		qtime = ts2ms(&diff);
@@ -905,7 +900,7 @@ process:
 	destroy_resolver();
 
 log:
-	if ((config.log || config.log_file) && q->qtype_id == RR_TYPE_SOA) {
+	if (config.log && q->qtype_id == RR_TYPE_SOA) {
 		log.reqtime = reqtime;
 		log.qtime = qtime;
 		log.ftime = ftime;
@@ -915,10 +910,7 @@ log:
 		log.qtype = q->qtype_id;
 		sprintf(log.qname, "%s", q->qname);
 		sprintf(log.remote, "%s", q->remote_ip);
-		if (config.log)
-			insert_log(&log);
-		if (config.log_file)
-			write_log(&log);
+		write_log(&log);
 	}
 
 	if (config.redirect_error)
@@ -1040,9 +1032,9 @@ int read_config(void)
 {
 	keyval_t *key;
 	char *host, *database, *username, *password, *cache_host, 
-		*log_database, *log_dir, *landing_page, *redirect_address;
+		*log_dir, *landing_page, *redirect_address;
 
-	host = database = username = password = cache_host = log_database = NULL;
+	host = database = username = password = cache_host = NULL;
 	log_dir = redirect_address = NULL;
 
 	key = keyval_new(CONFIG_FILE);
@@ -1058,8 +1050,6 @@ int read_config(void)
 	if (password == NULL) goto err;
 	cache_host = keyval_get_string(key, "cache-host");
 	if (cache_host == NULL) goto err;
-	log_database = keyval_get_string(key, "log-database");
-	if (log_database == NULL) goto err;
 	landing_page = keyval_get_string(key, "landing-page");
 	if (landing_page == NULL) goto err;
 	log_dir = keyval_get_string(key, "log-dir");
@@ -1071,9 +1061,8 @@ int read_config(void)
 	config.port = keyval_get_integer(key, "port");
 	config.cache_port = keyval_get_integer(key, "cache-port");
 	config.filter = keyval_get_boolean(key, "filter");
-	config.log = keyval_get_boolean(key, "log");
+	config.log = keyval_get_boolean(key, "log-file");
 	config.debug = keyval_get_boolean(key, "debug");
-	config.log_file = keyval_get_boolean(key, "log-file");
 	config.use_recursor = keyval_get_boolean(key, "use-recursor");
 	config.redirect_error = keyval_get_boolean(key, "redirect-error");
 	keyval_free(key);
@@ -1083,7 +1072,6 @@ int read_config(void)
 	config.username = username;
 	config.password = password;
 	config.cache_host = cache_host;
-	config.log_database = log_database;
 	config.landing_page = landing_page;
 	config.log_dir = log_dir;
 	config.redirect_address = redirect_address;
@@ -1096,7 +1084,6 @@ err:
 	if (database != NULL) free(database);
 	if (username != NULL) free(username);
 	if (cache_host != NULL) free(cache_host);
-	if (log_database != NULL) free(log_database);
 	if (log_dir != NULL) free(log_dir);
 	if (redirect_address != NULL) free(redirect_address);
 
@@ -1806,56 +1793,6 @@ int lookup_cachedb(const struct query *q, queue_t **res)
 end:
 	destroy_cachedb();
 	return retval;
-}
-
-int insert_log(const struct log *log)
-{
-	struct tm *st;
-	static char cmd[BUFSIZ], reqtime[20];
-	int ret;
-
-	MYSQL *conn;
-	MYSQL *ptr;
-	unsigned int timeout = 3;
-
-	if ((conn = mysql_init(0)) == NULL) {
-		fprintf(stderr, "<< could not initialize logdb >>\n");
-		return 0;
-	}
-
-	ret = mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
-	if (ret == 0) {
-		ptr = mysql_real_connect(conn, config.host, config.username, 
-					config.password, config.log_database,
-					config.port, NULL, 0);
-		if (ptr == NULL) {
-			mysql_close(conn);
-			fprintf(stderr, "<< could not connect to logdb >>\n");
-			return 0;
-		}
-	}
-
-	st = localtime(&log->reqtime);
-	snprintf(reqtime, sizeof(reqtime), "%i-%.2i-%.2i %.2i:%.2i:%.2i", 
-		st->tm_year + 1900, st->tm_mon + 1, st->tm_mday,
-		st->tm_hour, st->tm_min, st->tm_sec);
-
-	sprintf(cmd, "INSERT INTO %i_%.2i VALUES(NULL, '%s', '%s', "
-		"'%s', '%s', %i, %i, %i, %i, %i)", st->tm_year + 1900,
-		st->tm_mon + 1, reqtime, log->remote, log->qname, 
-		type_str(log->qtype), log->qtime, log->ftime,
-		log->blacklist, log->exist, log->status);
-
-	ret = mysql_query(conn, cmd);
-
-	mysql_close(conn);
-
-	if (ret) {
-		fprintf(stderr, "<< could not run logdb query >>\n");
-		return 0;
-	}
-
-	return 1;
 }
 
 /*
