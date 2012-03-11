@@ -109,7 +109,6 @@ struct log {
 	int qtime;        /* Query time in miliseconds */
 	int ftime;	  /* Filter query time in miliseconds */
 	int blacklist;    /* Blacklist status */
-	int exist;        /* Name exist status */
 	int status;       /* Query status */
 	int qtype;        /* Record type of query */
 	char qname[256];  /* Name to query */
@@ -905,7 +904,6 @@ log:
 		log.qtime = qtime;
 		log.ftime = ftime;
 		log.blacklist = blacklist;
-		log.exist = rcode == LDNS_RCODE_NOERROR ? 1 : 0;
 		log.status = rcode;
 		log.qtype = q->qtype_id;
 		sprintf(log.qname, "%s", q->qname);
@@ -1818,9 +1816,9 @@ int write_log(const struct log *log)
 
 	sprintf(time_string, "%s_%.2i:%.2i:%.2i", date, 
 		st->tm_hour, st->tm_min, st->tm_sec);
-	snprintf(tmp, sizeof(tmp), "%s\t%s\t%i\t%i\t%i\t%i\t%i\t%i\t%s\n", 
+	snprintf(tmp, sizeof(tmp), "%s\t%s\t%i\t%i\t%i\t%i\t%i\t%s\n", 
 		time_string, log->remote, log->qtime, log->ftime, log->blacklist, 
-		log->exist, log->status, backend_id, log->qname);
+		log->status, backend_id, log->qname);
 
 	ret = fprintf(fp, tmp);
 	if (ret <= 0)
