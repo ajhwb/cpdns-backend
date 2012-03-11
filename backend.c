@@ -23,12 +23,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <mysql/mysql.h>
-#include <glib.h>
 #include <hiredis/hiredis.h>
 #include <ldns/ldns.h>
 #include <mysql/mysql.h>
 
 #include "queue.h"
+#include "keyval.h"
 #include "regdom.h"
 #include "tld-canon.h"
 
@@ -1038,46 +1038,45 @@ int parse_query(char *data, struct query *q)
 
 int read_config(void)
 {
-	GKeyFile *key = g_key_file_new ();
+	keyval_t *key;
 	char *host, *database, *username, *password, *cache_host, 
 		*log_database, *log_dir, *landing_page, *redirect_address;
-	int ret;
 
 	host = database = username = password = cache_host = log_database = NULL;
 	log_dir = redirect_address = NULL;
 
-	ret = g_key_file_load_from_file(key, CONFIG_FILE, G_KEY_FILE_NONE, NULL);
-	if (ret == 0) goto err;
+	key = keyval_new(CONFIG_FILE);
+	if (key == NULL) goto err;
 
-	host = g_key_file_get_string(key, "config", "host", NULL);
+	host = keyval_get_string(key, "host");
 	if (host == NULL) goto err;
-	database = g_key_file_get_string(key, "config", "database", NULL);
+	database = keyval_get_string(key, "database");
 	if (database == NULL) goto err;
-	username = g_key_file_get_string(key, "config", "username", NULL);
+	username = keyval_get_string(key, "username");
 	if (username == NULL) goto err;
-	password = g_key_file_get_string(key, "config", "password", NULL);
+	password = keyval_get_string(key, "password");
 	if (password == NULL) goto err;
-	cache_host = g_key_file_get_string(key, "config", "cache-host", NULL);
+	cache_host = keyval_get_string(key, "cache-host");
 	if (cache_host == NULL) goto err;
-	log_database = g_key_file_get_string(key, "config", "log-database", NULL);
+	log_database = keyval_get_string(key, "log-database");
 	if (log_database == NULL) goto err;
-	landing_page = g_key_file_get_string(key, "config", "landing-page", NULL);
+	landing_page = keyval_get_string(key, "landing-page");
 	if (landing_page == NULL) goto err;
-	log_dir = g_key_file_get_string(key, "config", "log-dir", NULL);
+	log_dir = keyval_get_string(key, "log-dir");
 	if (log_dir == NULL)
-		log_dir = g_strdup(LOG_DIR);
-	redirect_address = g_key_file_get_string(key, "config", "redirect-error-address", NULL);
+		log_dir = strdup(LOG_DIR);
+	redirect_address = keyval_get_string(key, "redirect-error-address");
 	if (redirect_address == NULL) goto err;
 
-	config.port = g_key_file_get_integer(key, "config", "port", NULL);
-	config.cache_port = g_key_file_get_integer(key, "config", "cache-port", NULL);
-	config.filter = g_key_file_get_boolean(key, "config", "filter", NULL);
-	config.log = g_key_file_get_boolean(key, "config", "log", NULL);
-	config.debug = g_key_file_get_boolean(key, "config", "debug", NULL);
-	config.log_file = g_key_file_get_boolean(key, "config", "log-file", NULL);
-	config.use_recursor = g_key_file_get_boolean(key, "config", "use-recursor", NULL);
-	config.redirect_error = g_key_file_get_boolean(key, "config", "redirect-error", NULL);
-	g_key_file_free(key);
+	config.port = keyval_get_integer(key, "port");
+	config.cache_port = keyval_get_integer(key, "cache-port");
+	config.filter = keyval_get_boolean(key, "filter");
+	config.log = keyval_get_boolean(key, "log");
+	config.debug = keyval_get_boolean(key, "debug");
+	config.log_file = keyval_get_boolean(key, "log-file");
+	config.use_recursor = keyval_get_boolean(key, "use-recursor");
+	config.redirect_error = keyval_get_boolean(key, "redirect-error");
+	keyval_free(key);
 
 	config.host = host;
 	config.database = database;
@@ -1092,14 +1091,14 @@ int read_config(void)
 	return 1;
 
 err:
-	g_key_file_free(key);
-	if (host != NULL) g_free(host);
-	if (database != NULL) g_free(database);
-	if (username != NULL) g_free(username);
-	if (cache_host != NULL) g_free(cache_host);
-	if (log_database != NULL) g_free(log_database);
-	if (log_dir != NULL) g_free(log_dir);
-	if (redirect_address != NULL) g_free(redirect_address);
+	keyval_free(key);
+	if (host != NULL) free(host);
+	if (database != NULL) free(database);
+	if (username != NULL) free(username);
+	if (cache_host != NULL) free(cache_host);
+	if (log_database != NULL) free(log_database);
+	if (log_dir != NULL) free(log_dir);
+	if (redirect_address != NULL) free(redirect_address);
 
 	return 0;
 }
@@ -1812,8 +1811,7 @@ end:
 int insert_log(const struct log *log)
 {
 	struct tm *st;
-	char *reqtime;
-	static char cmd[256];
+	static char cmd[BUFSIZ], reqtime[20];
 	int ret;
 
 	MYSQL *conn;
@@ -1838,9 +1836,9 @@ int insert_log(const struct log *log)
 	}
 
 	st = localtime(&log->reqtime);
-	reqtime = g_strdup_printf("%i-%.2i-%.2i %.2i:%.2i:%.2i", 
-				st->tm_year + 1900, st->tm_mon + 1, st->tm_mday,
-				st->tm_hour, st->tm_min, st->tm_sec);
+	snprintf(reqtime, sizeof(reqtime), "%i-%.2i-%.2i %.2i:%.2i:%.2i", 
+		st->tm_year + 1900, st->tm_mon + 1, st->tm_mday,
+		st->tm_hour, st->tm_min, st->tm_sec);
 
 	sprintf(cmd, "INSERT INTO %i_%.2i VALUES(NULL, '%s', '%s', "
 		"'%s', '%s', %i, %i, %i, %i, %i)", st->tm_year + 1900,
@@ -1849,7 +1847,6 @@ int insert_log(const struct log *log)
 		log->blacklist, log->exist, log->status);
 
 	ret = mysql_query(conn, cmd);
-	g_free(reqtime);
 
 	mysql_close(conn);
 
