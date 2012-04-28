@@ -1547,7 +1547,7 @@ static int lookup_a_record(const struct query *q)
 
 static void clear_cachedb(const struct query *q)
 {
-	redisReply *reply;
+	redisReply *reply, *nsmx_reply;
 	struct answer ans;
 	static char cmd_buffer[BUFSIZ];
 	int value, i;
@@ -1576,10 +1576,10 @@ static void clear_cachedb(const struct query *q)
 			snprintf(cmd_buffer, sizeof(cmd_buffer), "%s:NSMX:%s", 
 				 KEY_PREFIX, ans.data);
 
-			reply = redisCommand(cachedb_ctx, "DEL %s", cmd_buffer);
-			if (!reply)
+			nsmx_reply = redisCommand(cachedb_ctx, "DEL %s", cmd_buffer);
+			if (!nsmx_reply)
 				cachedb_error();
-			freeReplyObject(reply);
+			freeReplyObject(nsmx_reply);
 		}
 	}
 
