@@ -783,7 +783,7 @@ int do_query(const struct query *q)
 		return LDNS_RCODE_NOERROR;
 
 	result = init_resolver();
-        if (result == 0) {
+	if (result == 0) {
 		fprintf(stderr, "<< could not initialize resolver >>\n");
 		exit(EXIT_FAILURE);
 	}
