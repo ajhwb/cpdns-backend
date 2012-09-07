@@ -95,6 +95,7 @@ struct config {
 	char *landing_page;
 	char *log_dir;
 	char *redirect_address;
+	char *recursor_file;
 	unsigned short port;
 	unsigned short cache_port;
 	int filter;
@@ -230,7 +231,7 @@ static int init_resolver(void)
 
 	resolver = NULL;
 
-	status = ldns_resolver_new_frm_file(&resolver, NULL);
+	status = ldns_resolver_new_frm_file(&resolver, config.recursor_file);
 
 	if (status != LDNS_STATUS_OK)
 		return 0;
@@ -781,7 +782,11 @@ int do_query(const struct query *q)
 	} else if (result == -2)
 		return LDNS_RCODE_NOERROR;
 
-	init_resolver();
+	result = init_resolver();
+        if (result == 0) {
+		fprintf(stderr, "<< could not initialize resolver >>\n");
+		exit(EXIT_FAILURE);
+	}
 
 	rdf = ldns_dname_new_frm_str(q->qname);
 	if (!rdf) {
@@ -1030,7 +1035,7 @@ int read_config(void)
 {
 	keyval_t *key;
 	char *host, *database, *username, *password, *cache_host, 
-		*log_dir, *landing_page, *redirect_address;
+		*log_dir, *landing_page, *redirect_address, *recursor_file;
 
 	host = database = username = password = cache_host = NULL;
 	log_dir = redirect_address = NULL;
@@ -1055,6 +1060,8 @@ int read_config(void)
 		log_dir = strdup(LOG_DIR);
 	redirect_address = keyval_get_string(key, "redirect-error-address");
 	if (redirect_address == NULL) goto err;
+	recursor_file = keyval_get_string(key, "recursor-file");
+	if (recursor_file == NULL) goto err;
 
 	config.port = keyval_get_integer(key, "port");
 	config.cache_port = keyval_get_integer(key, "cache-port");
@@ -1073,6 +1080,7 @@ int read_config(void)
 	config.landing_page = landing_page;
 	config.log_dir = log_dir;
 	config.redirect_address = redirect_address;
+	config.recursor_file = recursor_file;
 
 	return 1;
 
